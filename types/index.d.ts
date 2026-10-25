@@ -23,6 +23,10 @@ export type Repo = {
   paused: Pause[]
   // Files the target changed since this checkout left it that this session also changed.
   upstream: string[]
+  // The first of this session's 100 ports, or null when it has no slot.
+  ports: number | null
+  // What setting up the worktree came to, or null when there was nothing to do.
+  setup: string | null
 }
 
 declare module 'claude-code' {

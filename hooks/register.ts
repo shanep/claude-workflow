@@ -2,9 +2,10 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { Pause } from '../types'
 
-// Keeps sessions in one repo from stepping on each other, ported from
-// Overlord's coordinator and cut down to three hooks with no timers, no
-// server and no fetch. Each session writes what it is changing to
+// Lets several Claude Code sessions work in one repo at once, ported from
+// Overlord and cut down to three hooks with no timers, no server and no fetch.
+//
+// Coordination. Each session writes what it is changing to
 // <git common dir>/workflow/sessions/<session id>.json, which every worktree
 // of the repo shares, and reads the others' files from there:
 //
@@ -17,10 +18,17 @@ import type { Pause } from '../types'
 //   while the conflict is still small. Worktrees share their remote refs, so
 //   a session that lands or fetches updates what every other one sees.
 //
-// A peer counts while its Claude Code process runs, which Claude Code's own
-// sessions/<pid>.json files say. Every hook lets its call through when it
-// throws, so a broken check never stops work. What it knows also goes in
-// $.state under workflow.repo for the drboom pane.
+// Ports. Each Claude Code process claims a slot (scripts/slot.sh), and every
+// Bash command it runs gets WORKFLOW_PORT_BASE, the first of 100 ports no
+// other session uses, so dev servers in parallel sessions never collide.
+//
+// Setup. A worktree with no node_modules gets a copy-on-write clone of the
+// main checkout's when the lockfiles match (scripts/clone.sh). Claude Code
+// itself copies the files .worktreeinclude names.
+//
+// A session counts while its Claude Code process runs. Every hook lets its
+// call through when it throws, so a broken check never stops work. What it
+// knows also goes in $.state under workflow.repo for the drboom pane.
 
 // Where this session works.
 interface Place {
@@ -32,8 +40,6 @@ interface Place {
   readonly target: string | null
   // True in the main checkout, where every session shares the working tree.
   readonly isMain: boolean
-  // This session's Claude Code process, or null when the registry has no entry for it.
-  readonly pid: number | null
 }
 
 // What one session tells the others.
@@ -52,6 +58,9 @@ interface Entry {
 const LOOK_MS = 30_000
 // An entry with no pid counts this long after it was last written.
 const NO_PID_MS = 30 * 60_000
+// Slot n gets ports PORT_BASE + n * PORT_STEP and up.
+const PORT_BASE = 40_000
+const PORT_STEP = 100
 
 const MAX_FILES = 8
 const MAX_PEERS = 8
@@ -59,6 +68,11 @@ const MAX_TOPIC = 80
 const MAX_PAUSES = 5
 
 const repo = { plugin: 'workflow', key: 'repo' } as const
+
+// The Claude Code process and its port slot, found once. A slot belongs to
+// the process, so /clear keeps it, and slot.sh takes it back once the process exits.
+let pidding: Promise<number | null> | undefined
+let slotting: Promise<number | null> | undefined
 
 // Everything below belongs to one session. session.end clears it, since /clear
 // starts a new session in the same process.
@@ -75,6 +89,10 @@ let upstream: string[] = []
 let lookedAt = 0
 // The set of peers the session was last told about, or null before the first prompt.
 let told: string | null = null
+// What setting up the worktree came to, for the pane and the first prompt.
+let setup: string | null = null
+let toldSetup = false
+let toldPorts = false
 // Each file and set of peers already paused once.
 let paused = new Set<string>()
 // The last few pauses, newest first, for the pane.
@@ -92,15 +110,18 @@ function forget(): void {
   upstream = []
   lookedAt = 0
   told = null
+  setup = null
+  toldSetup = false
+  toldPorts = false
   paused = new Set()
   pauses = []
   noticed = new Set()
 }
 
 // A command's output, or null when it fails. Git never stops to ask for a password.
-async function run($: EngineInterface, cwd: string, argv: readonly string[]): Promise<string | null> {
+async function run($: EngineInterface, cwd: string, argv: readonly string[], timeoutMs = 10_000): Promise<string | null> {
   try {
-    const ran = await $.process.run(argv, { cwd, timeoutMs: 10_000, env: { GIT_TERMINAL_PROMPT: '0' } })
+    const ran = await $.process.run(argv, { cwd, timeoutMs, env: { GIT_TERMINAL_PROMPT: '0' } })
     return ran.exitCode === 0 ? ran.stdout.trim() : null
   } catch {
     return null
@@ -115,27 +136,10 @@ function sessionsDir(place: Place): string {
   return `${place.common}/workflow/sessions`
 }
 
-// This session's pid from Claude Code's registry of running sessions.
-async function ownPid($: EngineInterface, cwd: string): Promise<number | null> {
-  const home = await run($, cwd, ['sh', '-c', 'printf %s "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"'])
-  const registry = `${home ?? ''}/sessions`
-  if (home === null || !(await $.fs.exists(registry))) {
-    return null
-  }
-  for (const file of await $.fs.list(registry)) {
-    if (file.kind !== 'file' || !file.name.endsWith('.json')) {
-      continue
-    }
-    try {
-      const item = JSON.parse(await $.fs.read(`${registry}/${file.name}`)) as { sessionId?: unknown; pid?: unknown }
-      if (item.sessionId === id && typeof item.pid === 'number') {
-        return item.pid
-      }
-    } catch {
-      // Caught halfway through a write.
-    }
-  }
-  return null
+// The Claude Code process, the parent of every command $.process.run starts.
+function ownPid($: EngineInterface): Promise<number | null> {
+  pidding ??= run($, '/', ['sh', '-c', 'echo $PPID']).then(out => (out === null || out === '' ? null : Number(out)))
+  return pidding
 }
 
 // The pids that still run, or null when the check did not run. kill -0 asks
@@ -150,6 +154,50 @@ async function alive($: EngineInterface, cwd: string, pids: readonly number[]): 
   return said.at(-1) === 'done' ? new Set(said.slice(0, -1).map(Number)) : null
 }
 
+// Claims a port slot and hands its ports to every Bash command from here on.
+async function claim($: EngineInterface): Promise<number | null> {
+  const pid = await ownPid($)
+  const home = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${(await $.env.get('HOME')) ?? ''}/.claude`
+  if (pid === null || home === '/.claude') {
+    return null
+  }
+  const out = await run($, '/', ['sh', `${$.plugin.root}/scripts/slot.sh`, `${home}/workflow/slots`, String(pid)])
+  const slot = out === null || out === '' ? NaN : Number(out)
+  if (!Number.isInteger(slot)) {
+    return null
+  }
+  await $.env.set('WORKFLOW_SLOT', String(slot))
+  await $.env.set('WORKFLOW_PORT_BASE', String(PORT_BASE + slot * PORT_STEP))
+  return slot
+}
+
+// The process's port slot, claimed once. Null when slot.sh could not claim one.
+function slotted($: EngineInterface): Promise<number | null> {
+  slotting ??= claim($)
+  return slotting
+}
+
+// Clones the main checkout's node_modules into a worktree that has none.
+async function setUp($: EngineInterface, place: Place): Promise<void> {
+  if (place.isMain || !place.common.endsWith('/.git')) {
+    return
+  }
+  const main = place.common.slice(0, -'/.git'.length)
+  try {
+    const ran = await $.process.run(['sh', `${$.plugin.root}/scripts/clone.sh`, main, place.root], { timeoutMs: 5 * 60_000 })
+    const said = ran.stdout.trim()
+    if (ran.exitCode !== 0) {
+      setup = `Copying node_modules from the main checkout failed: ${ran.stderr.trim().split('\n')[0] ?? ''}. Install packages before you build or test.`
+    } else if (said === 'cloned') {
+      setup = 'Copied node_modules from the main checkout, since the lockfiles match, so packages are already installed.'
+    } else if (said === 'differs') {
+      setup = 'This worktree has no node_modules and its lockfile differs from the main checkout\'s, so install packages before you build or test.'
+    }
+  } catch (error) {
+    setup = `Copying node_modules from the main checkout failed: ${String(error)}. Install packages before you build or test.`
+  }
+}
+
 async function locate($: EngineInterface): Promise<Place | null> {
   id = await $.session.id()
   const cwd = await $.session.cwd()
@@ -158,16 +206,17 @@ async function locate($: EngineInterface): Promise<Place | null> {
     return null
   }
   const head = await run($, root, ['git', 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])
-  return {
+  const place = {
     root,
     common,
     target: head === null ? null : head.replace(/^origin\//, ''),
     isMain: common === `${root}/.git`,
-    pid: await ownPid($, root),
   }
+  await setUp($, place)
+  return place
 }
 
-// The session's place, found once. Null outside git.
+// The session's place, found and set up once. Null outside git.
 function ready($: EngineInterface): Promise<Place | null> {
   placing ??= locate($)
   return placing
@@ -197,7 +246,7 @@ function myFiles(): string[] {
 }
 
 async function save($: EngineInterface, place: Place): Promise<void> {
-  const entry: Entry = { id, pid: place.pid, root: place.root, branch, topic, files: myFiles(), seen: await $.clock.now() }
+  const entry: Entry = { id, pid: await ownPid($), root: place.root, branch, topic, files: myFiles(), seen: await $.clock.now() }
   await $.fs.write(`${sessionsDir(place)}/${id}.json`, JSON.stringify(entry))
   await publish($, place)
 }
@@ -233,7 +282,7 @@ async function peers($: EngineInterface, place: Place): Promise<Entry[]> {
   }
   const now = await $.clock.now()
   const live = await alive($, place.root, entries.flatMap(entry => (entry.pid === null ? [] : [entry.pid])))
-  // Without ps every entry falls back to its age, and none is removed.
+  // Without kill every entry falls back to its age, and none is removed.
   const found = entries.filter(entry => (entry.pid === null || live === null ? now - entry.seen < NO_PID_MS : live.has(entry.pid)))
   const gone = entries.filter(entry => !found.includes(entry)).map(entry => `${entry.id}.json`)
   if (live !== null && gone.length > 0) {
@@ -247,6 +296,7 @@ async function publish($: EngineInterface, place: Place): Promise<void> {
   const files = myFiles()
   const mine = new Set(files)
   const others = await peers($, place)
+  const slot = await slotted($)
   await $.state.set(repo, {
     root: place.root,
     target: place.target,
@@ -255,6 +305,8 @@ async function publish($: EngineInterface, place: Place): Promise<void> {
     peers: others.map(peer => ({ topic: peer.topic, where: whereOf(peer, place), files: [...peer.files] })),
     paused: pauses,
     upstream: upstream.filter(file => mine.has(file)),
+    ports: slot === null ? null : PORT_BASE + slot * PORT_STEP,
+    setup,
   })
 }
 
@@ -282,6 +334,26 @@ function describe(peer: Entry, place: Place, files: readonly string[] = peer.fil
   const who = peer.topic === null ? 'A session' : `"${peer.topic}"`
   const changes = files.length === 0 ? 'no changes yet' : `changing ${fileList(files)}`
   return `- ${who} ${whereOf(peer, place)}, ${changes}`
+}
+
+// This session's ports, the first time only.
+async function portNote($: EngineInterface): Promise<string | null> {
+  const slot = await slotted($)
+  if (slot === null || toldPorts) {
+    return null
+  }
+  toldPorts = true
+  const base = PORT_BASE + slot * PORT_STEP
+  return `workflow: this session's ports are ${base} to ${base + PORT_STEP - 1}, and $WORKFLOW_PORT_BASE holds ${base}. Start dev servers and anything else that listens on a port there, so sessions running side by side never collide.`
+}
+
+// What setting up the worktree came to, the first time only.
+function setupNote(): string | null {
+  if (setup === null || toldSetup) {
+    return null
+  }
+  toldSetup = true
+  return `workflow: ${setup}`
 }
 
 // Who else works in the repo, when that changed since the session last heard.
@@ -349,7 +421,8 @@ async function pause($: EngineInterface, place: Place, relative: string): Promis
 
 export const register: Register = on => {
   on('session.end', async ($, e, next) => {
-    const place = await ready($)
+    // A session that never looked has nothing to remove and nothing to set up.
+    const place = placing === undefined ? null : await placing
     if (place !== null) {
       await run($, place.root, ['rm', '-f', `${sessionsDir(place)}/${id}.json`])
     }
@@ -361,15 +434,19 @@ export const register: Register = on => {
   })
 
   on('prompt.submit', async ($, e, next) => {
-    const place = e.isMeta === true ? null : await ready($)
-    if (place === null) {
+    if (e.isMeta === true) {
       return next(e)
     }
-    topic ??= topicOf(e.text)
-    await look($, place)
-    await save($, place)
-    const notes = [await peerNote($, place), landingNote(place)].filter((note): note is string => note !== null)
-    return notes.length === 0 ? next(e) : next({ ...e, context: [...(e.context ?? []), ...notes] })
+    const notes = [await portNote($)]
+    const place = await ready($)
+    if (place !== null) {
+      topic ??= topicOf(e.text)
+      await look($, place)
+      await save($, place)
+      notes.push(setupNote(), await peerNote($, place), landingNote(place))
+    }
+    const given = notes.filter((note): note is string => note !== null)
+    return given.length === 0 ? next(e) : next({ ...e, context: [...(e.context ?? []), ...given] })
   }).catch(($, e, next) => next(e))
 
   // Pauses an edit to a file another session is changing and remembers the
@@ -378,6 +455,10 @@ export const register: Register = on => {
   // a background session seldom gets a second prompt.
   on('tool.call', async ($, e, next) => {
     const file = e.tool === 'Edit' || e.tool === 'Write' ? e.file_path : e.tool === 'NotebookEdit' ? e.notebook_path : null
+    if (e.tool === 'Bash') {
+      // The ports, for a session that started before the plugin loaded.
+      await slotted($)
+    }
     const place = file === null && e.tool !== 'Bash' ? null : await ready($)
     const relative = place === null || file === null ? null : relativeTo(place.root, file)
     if (place !== null && relative !== null) {

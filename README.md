@@ -1,8 +1,8 @@
 # Workflow
 
 A Claude Code plugin that keeps parallel sessions in one git repo out of each
-other's files. Run a few sessions at once, in the main checkout or in
-worktrees, and each one knows what the others are changing.
+other's files and ports. Run a few sessions at once, in the main checkout or
+in worktrees, and each one knows what the others are changing.
 
 It is three hooks and some files in `.git`. There are no timers, no server and
 no background fetch, and every hook lets the call through if it breaks, so a
@@ -27,14 +27,23 @@ claude plugin install workflow@shanep
 - **Says when to rebase.** When commits land on origin's default branch that
   change files this session also changed, the next prompt or Bash result says
   so, once per file, while the conflict is still small.
+- **Gives each session its own ports.** Every Bash command gets
+  `WORKFLOW_PORT_BASE`, the first of 100 ports no other session has (40000,
+  40100 and so on), and `WORKFLOW_SLOT`, the slot number. Point dev servers at
+  it and two sessions never fight over port 3000. The first prompt says so.
+- **Sets up new worktrees.** A worktree with no `node_modules` gets a
+  copy-on-write clone of the main checkout's when the lockfiles match, which
+  takes a second or two instead of an install. When they differ, Claude is
+  told to install. Claude Code itself copies the files `.worktreeinclude`
+  names, like `.env`.
 
 ## How it works
 
 Each session writes what it is changing to
 `.git/workflow/sessions/<session id>.json`. All worktrees share that folder,
 so every session sees every other one. A session counts while its Claude Code
-process runs (from Claude Code's own `~/.claude/sessions` files), and a file
-left by a session that crashed is removed the next time another session looks.
+process runs, and a file left by a session that crashed is removed the next
+time another session looks.
 
 In a worktree the changed files come from git: everything the branch changed
 since it left the default branch, plus untracked files. In the main checkout
@@ -45,13 +54,20 @@ Git runs at most every 30 seconds, on a prompt or after a Bash call. Nothing
 fetches. Worktrees share their remote branches, so once any session lands or
 fetches, the others see it.
 
+Port slots are folders under `~/.claude/workflow/slots/`. A session claims the
+lowest free one with `mkdir`, which only one session can win, and a slot whose
+Claude Code process has exited is taken back by the next session that needs
+one. `scripts/slot.sh` and `scripts/clone.sh` do the work.
+
 ## For other plugins
 
 The plugin keeps what it knows in `$.state` under `workflow.repo`: the
 checkout, the target branch, this session's files, the other sessions, recent
-pauses and the upstream files to rebase on. `types/index.d.ts` has the shape.
-List `workflow` under `dependencies` in your `plugin.json` to read it. The
-`/boom` pane in [drboom](https://github.com/shanep/claude-DrBOOM) does.
+pauses, the upstream files to rebase on, the port base and how the worktree
+setup went. `types/index.d.ts` has the shape. Copy the `Repo` type into your
+own contract instead of listing `workflow` under `dependencies`, since a
+missing dependency turns your whole plugin off. The `/boom` pane in
+[drboom](https://github.com/shanep/claude-DrBOOM) does this.
 
 ## Checks
 
@@ -61,4 +77,5 @@ git config core.hooksPath .githooks
 ```
 
 The second command runs the checks before every push. They validate the JSON,
-and where Claude Code is installed, the plugin itself.
+run shellcheck and the script tests, and where Claude Code is installed,
+validate the plugin itself.
