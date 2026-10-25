@@ -1,0 +1,8 @@
+{
+  "name": "workflow",
+  "private": true,
+  "description": "Claude Code plugin that keeps parallel sessions in one repo out of each other's files",
+  "scripts": {
+    "check": "sh scripts/check.sh"
+  }
+}

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Run the checks before every push. Enable with: git config core.hooksPath .githooks
+exec npm run --silent check
