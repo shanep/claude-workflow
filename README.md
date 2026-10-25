@@ -11,8 +11,8 @@ bad check never stops your work.
 ## Install
 
 ```
-/plugin marketplace add shanep/claude-plugins
-/plugin install workflow@shanep
+claude plugin marketplace add shanep/claude-plugins
+claude plugin install workflow@shanep
 ```
 
 ## What it does
