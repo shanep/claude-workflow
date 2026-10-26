@@ -51,6 +51,11 @@ claude plugin install workflow@shanep
   150 on 10 cores and every one crawled, so taking turns gets each done
   sooner. Set `WORKFLOW_CHECK_SLOTS` to change the limit. A check that waits
   over 10 minutes runs anyway, and Claude hears how long it waited.
+- **Keeps the computer awake.** Once a session gets its first prompt, the
+  computer does not sleep until that Claude Code process exits, so long work
+  and plans finish overnight. The display still turns off. It uses
+  `caffeinate` on macOS and `systemd-inhibit` on Linux. Set
+  `WORKFLOW_KEEP_AWAKE=0` to turn it off.
 - **Keeps noisy work out of the conversation.** Two skills and two agents
   keep long output from filling Claude's context. `/workflow:quiet-run` runs a
   build or test suite into a log and brings back only the errors.
@@ -100,6 +105,11 @@ starts before the command and kills once it is done. The command itself is
 never changed, so your permission rules see it as written. The holder also
 exits if Claude Code does, so a crash or Esc never leaves a slot taken.
 
+The keep awake holder watches the Claude Code process and exits with it, so
+a crash never leaves the computer awake. `scripts/awake.sh` starts one per
+process and notes it under `~/.claude/workflow/awake/`, so a reload or
+`/clear` does not start a second.
+
 A plan is a folder under `.git/workflow/plans/<plan id>/` with the tasks in
 `plan.json`. There is no runner process. A task's session ends by saying
 `LANDED <sha>` or `FAILED <reason>`, and when its turn ends the plugin checks
@@ -121,9 +131,9 @@ is checked when a prompt is sent and after each tool call.
 The plugin keeps what it knows in `$.state` under `workflow.repo`: the
 checkout, the target branch, this session's files, the other sessions, recent
 pauses, the upstream files to rebase on, the port base, how the worktree setup
-went, how many check slots are busy, what the startup check found and the
-newest plans, with what each task cost, and this session's progress and
-budget.
+went, how many check slots are busy, what the startup check found, whether it
+keeps the computer awake, the newest plans with what each task cost, and this
+session's progress and budget.
 `types/index.d.ts` has the shape. Copy the `Repo` type into your own contract
 instead of listing `workflow` under `dependencies`, since a missing dependency
 turns your whole plugin off. The `/boom` pane in

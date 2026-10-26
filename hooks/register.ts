@@ -38,6 +38,11 @@ import type { Health, Pause, PlanTaskView, PlanView, Progress } from '../types'
 // spending budget, and a plan can set one for each task. A session that goes
 // past its budget says so once, to the person and to the model.
 //
+// Keep awake. Once a session gets its first prompt, scripts/awake.sh keeps the
+// computer from sleeping until its Claude Code process exits, so long work and
+// plans finish overnight. The display still turns off. WORKFLOW_KEEP_AWAKE=0
+// turns it off.
+//
 // Plans. /workflow:plan splits a goal into tasks, and each task runs as a
 // background session in its own worktree once the tasks it depends on have
 // landed. See the Plans section below.
@@ -110,6 +115,8 @@ const TASK_TOOLS: ReadonlySet<string> = new Set(['TaskCreate', 'TaskUpdate', 'To
 // the process, so /clear keeps it, and slot.sh takes it back once the process exits.
 let pidding: Promise<number | null> | undefined
 let slotting: Promise<number | null> | undefined
+// Whether awake.sh holds the computer awake for the process, asked once.
+let awaking: Promise<boolean> | undefined
 
 // Everything below belongs to one session. session.end clears it, since /clear
 // starts a new session in the same process.
@@ -247,6 +254,24 @@ async function claim($: EngineInterface): Promise<number | null> {
 function slotted($: EngineInterface): Promise<number | null> {
   slotting ??= claim($)
   return slotting
+}
+
+// Keeps the computer awake while the process runs, unless WORKFLOW_KEEP_AWAKE is 0.
+async function stayAwake($: EngineInterface): Promise<boolean> {
+  if ((await $.env.get('WORKFLOW_KEEP_AWAKE')) === '0') {
+    return false
+  }
+  const pid = await ownPid($)
+  const dir = await shared($)
+  if (pid === null || dir === null) {
+    return false
+  }
+  return (await run($, '/', ['sh', `${$.plugin.root}/scripts/awake.sh`, `${dir}/awake`, String(pid)])) === 'awake'
+}
+
+function awake($: EngineInterface): Promise<boolean> {
+  awaking ??= stayAwake($)
+  return awaking
 }
 
 // Clones the main checkout's node_modules into a worktree that has none.
@@ -467,6 +492,7 @@ async function publish($: EngineInterface, place: Place): Promise<void> {
     setup,
     plans,
     progress,
+    isAwake: await awake($),
   })
 }
 
@@ -1185,6 +1211,7 @@ export const register: Register = on => {
     if (e.isMeta === true) {
       return next(e)
     }
+    await awake($)
     const notes = [await portNote($)]
     const place = await ready($)
     if (place !== null) {

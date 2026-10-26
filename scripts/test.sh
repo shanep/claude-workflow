@@ -1,5 +1,5 @@
 #!/bin/sh
-# Test slot.sh and clone.sh in a scratch folder. Run by check.sh.
+# Test slot.sh, clone.sh, turn.sh and awake.sh in a scratch folder. Run by check.sh.
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -82,5 +82,22 @@ kill "$fourth"
 wait "$fourth"
 expect "no tickets are left behind" "$(find "$checks" -name 'ticket-*')" ""
 unset WORKFLOW_CHECK_SLOTS
+
+# Only macOS is sure to have a holder, since systemd-inhibit needs logind.
+if command -v caffeinate >/dev/null 2>&1; then
+    awake="$work/awake"
+    sleep 60 &
+    owner=$!
+    expect "awake.sh holds the computer awake" "$(sh "$here/awake.sh" "$awake" "$owner")" awake
+    holder=$(cat "$awake/$owner")
+    expect "a second call says awake" "$(sh "$here/awake.sh" "$awake" "$owner")" awake
+    expect "and keeps the same holder" "$(cat "$awake/$owner")" "$holder"
+    kill "$owner"
+    wait "$owner" 2>/dev/null
+    sleep 1
+    expect "the holder exits with its owner" "$(kill -0 "$holder" 2>/dev/null && echo running)" ""
+    sh "$here/awake.sh" "$awake" "$$" >/dev/null
+    expect "the dead owner's file is removed" "$([ -e "$awake/$owner" ] && echo left)" ""
+fi
 
 exit "$failed"

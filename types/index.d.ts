@@ -77,6 +77,8 @@ export type Repo = {
   plans: PlanView[]
   // This session's own progress.
   progress: Progress | null
+  // Whether this session keeps the computer from sleeping.
+  isAwake: boolean
 }
 
 declare module 'claude-code' {
