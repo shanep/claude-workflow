@@ -1,7 +1,7 @@
 # Workflow
 
 A Claude Code plugin that keeps parallel sessions in one git repo out of each
-other's files and ports. Run a few sessions at once, in the main checkout or
+other's files and ports, and keeps their checks from swamping the machine. Run a few sessions at once, in the main checkout or
 in worktrees, and each one knows what the others are changing.
 
 It is three hooks and some files in `.git`. There are no timers, no server and
@@ -36,6 +36,13 @@ claude plugin install workflow@shanep
   takes a second or two instead of an install. When they differ, Claude is
   told to install. Claude Code itself copies the files `.worktreeinclude`
   names, like `.env`.
+- **Takes turns at checks.** When Claude runs a check (`npm test`,
+  `make check`, `tsc`, `pytest`, `cargo test`, `git push`, `land` and the
+  like), it first waits for one of a few machine-wide check slots, a third of
+  the cores by default. A dozen sessions testing at once pushed the load past
+  150 on 10 cores and every one crawled, so taking turns gets each done
+  sooner. Set `WORKFLOW_CHECK_SLOTS` to change the limit. A check that waits
+  over 10 minutes runs anyway, and Claude hears how long it waited.
 
 ## How it works
 
@@ -59,12 +66,17 @@ lowest free one with `mkdir`, which only one session can win, and a slot whose
 Claude Code process has exited is taken back by the next session that needs
 one. `scripts/slot.sh` and `scripts/clone.sh` do the work.
 
+A check slot is held by a small `scripts/turn.sh` process that the hook
+starts before the command and kills once it is done. The command itself is
+never changed, so your permission rules see it as written. The holder also
+exits if Claude Code does, so a crash or Esc never leaves a slot taken.
+
 ## For other plugins
 
 The plugin keeps what it knows in `$.state` under `workflow.repo`: the
 checkout, the target branch, this session's files, the other sessions, recent
-pauses, the upstream files to rebase on, the port base and how the worktree
-setup went. `types/index.d.ts` has the shape. Copy the `Repo` type into your
+pauses, the upstream files to rebase on, the port base, how the worktree
+setup went and how many check slots are busy. `types/index.d.ts` has the shape. Copy the `Repo` type into your
 own contract instead of listing `workflow` under `dependencies`, since a
 missing dependency turns your whole plugin off. The `/boom` pane in
 [drboom](https://github.com/shanep/claude-DrBOOM) does this.

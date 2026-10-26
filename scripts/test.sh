@@ -45,4 +45,42 @@ rm -rf "$wt/node_modules"
 expect "no lockfile means nothing to do" "$(sh "$here/clone.sh" "$main" "$wt")" ""
 expect "no temporary copy is left behind" "$(find "$wt" -name '.node_modules.workflow-*')" ""
 
+checks="$work/checks"
+export WORKFLOW_CHECK_SLOTS=1
+sh "$here/turn.sh" "$checks" hold "$$" 60 >"$work/first" &
+first=$!
+sleep 1
+expect "a hold with a free slot waits 0s" "$(cat "$work/first")" 0
+expect "a hold takes the only slot" "$(sh "$here/turn.sh" "$checks" count)" "1 1"
+sh "$here/turn.sh" "$checks" hold "$$" 60 >"$work/second" &
+second=$!
+sleep 2
+expect "a second hold waits" "$(cat "$work/second")" ""
+kill "$first"
+wait "$first"
+sleep 2
+expect "the waiting hold gets the slot once the first is killed" "$(cut -c1 "$work/second" | grep -c '[1-9]')" 1
+kill -9 "$second"
+wait "$second" 2>/dev/null
+expect "a holder killed with -9 does not count as busy" "$(sh "$here/turn.sh" "$checks" count)" "0 1"
+sleep 60 &
+owner=$!
+sh "$here/turn.sh" "$checks" hold "$owner" 60 >"$work/third" &
+third=$!
+sleep 1
+expect "a slot whose holder died is taken back" "$(cat "$work/third")" 0
+kill "$owner"
+wait "$owner" 2>/dev/null
+sleep 2
+expect "a hold ends when its owner exits" "$(kill -0 "$third" 2>/dev/null && echo running)" ""
+expect "and frees its slot" "$(sh "$here/turn.sh" "$checks" count)" "0 1"
+sh "$here/turn.sh" "$checks" hold "$$" 60 >/dev/null &
+fourth=$!
+sleep 1
+expect "a hold that waits too long gives up" "$(sh "$here/turn.sh" "$checks" hold "$$" 1)" none
+kill "$fourth"
+wait "$fourth"
+expect "no tickets are left behind" "$(find "$checks" -name 'ticket-*')" ""
+unset WORKFLOW_CHECK_SLOTS
+
 exit "$failed"

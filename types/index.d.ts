@@ -27,6 +27,8 @@ export type Repo = {
   ports: number | null
   // What setting up the worktree came to, or null when there was nothing to do.
   setup: string | null
+  // How many machine-wide check slots were busy, out of how many, at the last look.
+  checks: { busy: number; slots: number } | null
 }
 
 declare module 'claude-code' {

@@ -26,6 +26,12 @@ import type { Pause } from '../types'
 // main checkout's when the lockfiles match (scripts/clone.sh). Claude Code
 // itself copies the files .worktreeinclude names.
 //
+// Checks. A Bash command that looks like a check (tests, lint, a build, a push
+// or a landing) waits its turn at a few machine-wide slots (scripts/turn.sh),
+// so a dozen sessions testing at once do not slow every one of them to a
+// crawl. The hook waits before the command runs and frees the slot after, so
+// the command itself is never changed and permission rules see it as written.
+//
 // A session counts while its Claude Code process runs. Every hook lets its
 // call through when it throws, so a broken check never stops work. What it
 // knows also goes in $.state under workflow.repo for the drboom pane.
@@ -62,6 +68,13 @@ const NO_PID_MS = 30 * 60_000
 const PORT_BASE = 40_000
 const PORT_STEP = 100
 
+// Commands that run a repo's checks, matched where a command starts.
+const CHECK =
+  /(?:^|[\s;&|(/])(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:check|test|lint|typecheck|build|land)|npx\s+(?:tsc|vitest|jest|eslint|playwright)|(?:make|just)\s+(?:check|test|lint|build|land)|cargo\s+(?:test|build|clippy|check)|go\s+(?:test|build|vet)|git\s+push|pytest|tox|tsc|vitest|jest|eslint|mypy|pyright|land)(?=$|[\s;&|)])/
+
+// A check waits at most this long for a slot, in seconds, then runs anyway.
+const TURN_S = 10 * 60
+
 const MAX_FILES = 8
 const MAX_PEERS = 8
 const MAX_TOPIC = 80
@@ -87,6 +100,8 @@ let gitFiles: string[] = []
 // Files the default branch changed since this checkout left it.
 let upstream: string[] = []
 let lookedAt = 0
+// How many check slots were busy, out of how many, when the session last looked.
+let checks: { busy: number; slots: number } | null = null
 // The set of peers the session was last told about, or null before the first prompt.
 let told: string | null = null
 // What setting up the worktree came to, for the pane and the first prompt.
@@ -109,6 +124,7 @@ function forget(): void {
   gitFiles = []
   upstream = []
   lookedAt = 0
+  checks = null
   told = null
   setup = null
   toldSetup = false
@@ -155,13 +171,19 @@ async function alive($: EngineInterface, cwd: string, pids: readonly number[]): 
 }
 
 // Claims a port slot and hands its ports to every Bash command from here on.
+// Where workflow keeps what all sessions on this machine share, or null without a home.
+async function shared($: EngineInterface): Promise<string | null> {
+  const home = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${(await $.env.get('HOME')) ?? ''}/.claude`
+  return home === '/.claude' ? null : `${home}/workflow`
+}
+
 async function claim($: EngineInterface): Promise<number | null> {
   const pid = await ownPid($)
-  const home = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${(await $.env.get('HOME')) ?? ''}/.claude`
-  if (pid === null || home === '/.claude') {
+  const dir = await shared($)
+  if (pid === null || dir === null) {
     return null
   }
-  const out = await run($, '/', ['sh', `${$.plugin.root}/scripts/slot.sh`, `${home}/workflow/slots`, String(pid)])
+  const out = await run($, '/', ['sh', `${$.plugin.root}/scripts/slot.sh`, `${dir}/slots`, String(pid)])
   const slot = out === null || out === '' ? NaN : Number(out)
   if (!Number.isInteger(slot)) {
     return null
@@ -239,6 +261,64 @@ async function look($: EngineInterface, place: Place): Promise<void> {
     ]
   }
   upstream = base === null ? [] : lines(await run($, place.root, ['git', 'diff', '--name-only', base, `origin/${place.target}`]))
+  const dir = await shared($)
+  const count = dir === null ? null : await run($, '/', ['sh', `${$.plugin.root}/scripts/turn.sh`, `${dir}/checks`, 'count'])
+  const [busy, slots] = (count ?? '').split(' ').map(Number)
+  checks = busy === undefined || slots === undefined || Number.isNaN(busy) || Number.isNaN(slots) ? null : { busy, slots }
+}
+
+// A check slot this session holds, and how long it waited for it.
+interface Turn {
+  readonly waited: number
+  // Frees the slot by ending the process that holds it.
+  readonly give: () => Promise<void>
+}
+
+// Waits for a check slot. A turn.sh process holds it until the loop that
+// reads it ends, which kills it, and it ends by itself if Claude Code exits,
+// so no slot outlives its check. Null when there is no slot to be had within
+// TURN_S, and the check runs anyway.
+async function takeTurn($: EngineInterface): Promise<Turn | null> {
+  const dir = await shared($)
+  const pid = await ownPid($)
+  if (dir === null || pid === null) {
+    return null
+  }
+  const turn = `${$.plugin.root}/scripts/turn.sh`
+  const [busy, slots] = ((await run($, '/', ['sh', turn, `${dir}/checks`, 'count'])) ?? '').split(' ').map(Number)
+  const isFull = busy !== undefined && slots !== undefined && busy >= slots
+  if (isFull) {
+    await $.ui.status('workflow: waiting for a check slot')
+  }
+  const pieces = $.process.spawn({ argv: ['sh', turn, `${dir}/checks`, 'hold', String(pid), String(TURN_S)] })[Symbol.asyncIterator]()
+  const give = async (): Promise<void> => {
+    await pieces.return?.({ code: null, signal: 'SIGTERM' })
+  }
+  try {
+    let said = ''
+    while (!said.includes('\n')) {
+      const piece = await pieces.next()
+      if (piece.done === true || !('text' in piece.value)) {
+        return null
+      }
+      if (piece.value.stream === 'stdout') {
+        said += piece.value.text
+      }
+    }
+    const waited = Number(said.trim())
+    if (Number.isNaN(waited)) {
+      await give()
+      return null
+    }
+    return { waited, give }
+  } catch (error) {
+    await give()
+    throw error
+  } finally {
+    if (isFull) {
+      await $.ui.status(undefined)
+    }
+  }
 }
 
 function myFiles(): string[] {
@@ -305,6 +385,7 @@ async function publish($: EngineInterface, place: Place): Promise<void> {
     peers: others.map(peer => ({ topic: peer.topic, where: whereOf(peer, place), files: [...peer.files] })),
     paused: pauses,
     upstream: upstream.filter(file => mine.has(file)),
+    checks,
     ports: slot === null ? null : PORT_BASE + slot * PORT_STEP,
     setup,
   })
@@ -467,9 +548,21 @@ export const register: Register = on => {
         return { deny: warning }
       }
     }
-    const ran = await next(e)
-    if (place === null || ran.deny !== undefined) {
+    // A background command returns as soon as it starts, so a slot would not cover it.
+    const turn = e.tool === 'Bash' && e.run_in_background !== true && CHECK.test(e.command) ? await takeTurn($) : null
+    let ran: Awaited<ReturnType<typeof next>>
+    try {
+      ran = await next(e)
+    } finally {
+      await turn?.give()
+    }
+    const waitNote =
+      turn === null || turn.waited === 0 ? null : `workflow: this command waited ${turn.waited}s for a check slot, since other sessions' checks held all of them.`
+    if (ran.deny !== undefined) {
       return ran
+    }
+    if (place === null) {
+      return waitNote === null ? ran : { ...ran, context: [...(ran.context ?? []), waitNote] }
     }
     if (relative !== null) {
       edited.add(relative)
@@ -477,7 +570,7 @@ export const register: Register = on => {
       await look($, place)
     }
     await save($, place)
-    const note = landingNote(place)
-    return note === null ? ran : { ...ran, context: [...(ran.context ?? []), note] }
+    const notes = [waitNote, landingNote(place)].filter((note): note is string => note !== null)
+    return notes.length === 0 ? ran : { ...ran, context: [...(ran.context ?? []), ...notes] }
   }).catch(($, e, next) => next(e))
 }
