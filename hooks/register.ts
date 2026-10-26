@@ -1,6 +1,6 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AuditEntry, Health, Pause, PlanTaskView, PlanView, Progress } from '../types'
+import type { AuditEntry, Connectors, Health, Pause, PlanTaskView, PlanView, Progress } from '../types'
 
 // Lets several Claude Code sessions work in one repo at once, ported from
 // Overlord and cut down to three hooks with no timers, no server and no fetch.
@@ -91,6 +91,8 @@ interface TaskItem {
 
 // Git runs at most this often, since a prompt or Bash call can come every second.
 const LOOK_MS = 30_000
+// connectors.sh refreshes its list at most this often.
+const CONNECTORS_MS = 10 * 60_000
 // An entry with no pid counts this long after it was last written.
 const NO_PID_MS = 30 * 60_000
 // Slot n gets ports PORT_BASE + n * PORT_STEP and up.
@@ -139,6 +141,9 @@ let lookedAt = 0
 let checks: { busy: number; slots: number } | null = null
 // What scripts/health.sh found when the session started, once it is done.
 let health: Health | null = null
+// What connectors.sh last found, and whether the session heard about it.
+let connectors: Connectors | null = null
+let toldConnectors = false
 // The set of peers the session was last told about, or null before the first prompt.
 let told: string | null = null
 // What setting up the worktree came to, for the pane and the first prompt.
@@ -178,6 +183,8 @@ function forget(): void {
   lookedAt = 0
   checks = null
   health = null
+  connectors = null
+  toldConnectors = false
   told = null
   setup = null
   toldSetup = false
@@ -349,6 +356,12 @@ async function look($: EngineInterface, place: Place): Promise<void> {
   const count = dir === null ? null : await run($, '/', ['sh', `${$.plugin.root}/scripts/turn.sh`, `${dir}/checks`, 'count'])
   const [busy, slots] = (count ?? '').split(' ').map(Number)
   health = await readHealth($, place)
+  connectors = await readConnectors($, place)
+  if (connectors === null || now - connectors.at > CONNECTORS_MS) {
+    // The list takes seconds, so it runs on its own and a later look reads it.
+    const script = `${$.plugin.root}/scripts/connectors.sh`
+    await run($, place.root, ['sh', '-c', 'nohup sh "$0" "$1" "$2" </dev/null >/dev/null 2>&1 &', script, connectorsFile(place), place.root])
+  }
   plans = await readPlans($, place)
   checks = busy === undefined || slots === undefined || Number.isNaN(busy) || Number.isNaN(slots) ? null : { busy, slots }
 }
@@ -371,6 +384,50 @@ async function readHealth($: EngineInterface, place: Place): Promise<Health | nu
   }
   const seconds = Number(at)
   return Number.isNaN(seconds) ? null : { at: seconds * 1000, problems }
+}
+
+function connectorsFile(place: Place): string {
+  return `${place.common}/workflow/connectors.txt`
+}
+
+// Reads lines like "claude.ai Gmail: https://... - ✓ Connected". The command
+// can hold " - " too, so the status is what follows the last one.
+async function readConnectors($: EngineInterface, place: Place): Promise<Connectors | null> {
+  const file = connectorsFile(place)
+  if (!(await $.fs.exists(file))) {
+    return null
+  }
+  const at = (await $.fs.stat(file)).mtimeMs
+  let connected = 0
+  const problems: string[] = []
+  for (const line of (await $.fs.read(file)).split('\n')) {
+    const found = /^(.+?): .* - (.+)$/.exec(line)
+    if (found === null) {
+      continue
+    }
+    const status = (found[2] ?? '').replace(/^[^A-Za-z]+/, '').trim()
+    if (/^connected/i.test(status)) {
+      connected += 1
+    } else {
+      problems.push(`${found[1] ?? ''}: ${status}`)
+    }
+  }
+  return { at, ready: connected, problems }
+}
+
+// What is connected, once a session, with the rule for tasks that need a connector.
+function connectorNote(): string | null {
+  if (connectors === null || toldConnectors) {
+    return null
+  }
+  toldConnectors = true
+  const broken =
+    connectors.problems.length === 0 ? '' : ` These are not working: ${connectors.problems.join('; ')}.`
+  return (
+    `workflow: ${connectors.ready} MCP servers and connectors are connected.${broken} ` +
+    'Before a plan or a multi-step task that needs a connector, check that each one it needs works now: its tools are listed and a cheap read-only call succeeds (list_connected_browsers for Chrome). ' +
+    'Background tasks and subagents use the same connectors. If one is missing or fails, stop before starting and tell the person which one and how to fix it (/mcp).'
+  )
 }
 
 // A check slot this session holds, and how long it waited for it.
@@ -500,6 +557,7 @@ async function publish($: EngineInterface, place: Place): Promise<void> {
     progress,
     isAwake: await awake($),
     audit: await auditView(),
+    connectors,
   })
 }
 
@@ -1369,7 +1427,7 @@ export const register: Register = on => {
       topic ??= topicOf(e.text)
       await look($, place)
       await save($, place)
-      notes.push(setupNote(), await peerNote($, place), landingNote(place), await budgetNote($, place))
+      notes.push(setupNote(), connectorNote(), await peerNote($, place), landingNote(place), await budgetNote($, place))
     }
     const given = notes.filter((note): note is string => note !== null)
     return given.length === 0 ? next(e) : next({ ...e, context: [...(e.context ?? []), ...given] })

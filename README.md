@@ -60,6 +60,11 @@ claude plugin install workflow@shanep
   refuses goes in a log, so you can look back at what ran without you.
   `/audit` lists this session's and `/audit all` every session's from the
   last day, and the /boom pane shows the newest few.
+- **Checks connectors before work that needs them.** The first prompt says
+  which MCP servers and connectors are connected and which are not, and asks
+  Claude to check that the ones a plan or long task needs work before it
+  starts, and to stop and tell you when one is missing. The /boom pane shows
+  the same.
 - **Keeps noisy work out of the conversation.** Two skills and two agents
   keep long output from filling Claude's context. `/workflow:quiet-run` runs a
   build or test suite into a log and brings back only the errors.
@@ -122,6 +127,12 @@ as its own event. Each session keeps its own file under
 days are removed. Commands are kept as Claude ran them, so the log holds
 whatever the commands held.
 
+The connector list comes from `claude mcp list`, which takes a few seconds,
+so `scripts/connectors.sh` runs it in the background at most every 10
+minutes and leaves it in `.git/workflow/connectors.txt` for every session in
+the repo. A session reads it when it looks, so the very first session in a
+repo hears about connectors on a later prompt.
+
 A plan is a folder under `.git/workflow/plans/<plan id>/` with the tasks in
 `plan.json`. There is no runner process. A task's session ends by saying
 `LANDED <sha>` or `FAILED <reason>`, and when its turn ends the plugin checks
@@ -144,7 +155,7 @@ The plugin keeps what it knows in `$.state` under `workflow.repo`: the
 checkout, the target branch, this session's files, the other sessions, recent
 pauses, the upstream files to rebase on, the port base, how the worktree setup
 went, how many check slots are busy, what the startup check found, whether it
-keeps the computer awake, what auto mode decided, the newest plans with what
+keeps the computer awake, what auto mode decided, which connectors work, the newest plans with what
 each task cost, and this session's progress and budget.
 `types/index.d.ts` has the shape. Copy the `Repo` type into your own contract
 instead of listing `workflow` under `dependencies`, since a missing dependency

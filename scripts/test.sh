@@ -1,5 +1,5 @@
 #!/bin/sh
-# Test slot.sh, clone.sh, turn.sh and awake.sh in a scratch folder. Run by check.sh.
+# Test slot.sh, clone.sh, turn.sh, awake.sh and connectors.sh in a scratch folder. Run by check.sh.
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -99,5 +99,22 @@ if command -v caffeinate >/dev/null 2>&1; then
     sh "$here/awake.sh" "$awake" "$$" >/dev/null
     expect "the dead owner's file is removed" "$([ -e "$awake/$owner" ] && echo left)" ""
 fi
+
+cache="$work/connectors/list.txt"
+export WORKFLOW_MCP_LIST="echo 'gmail: https://example.com - ok'"
+sh "$here/connectors.sh" "$cache" "$work"
+expect "connectors.sh writes the list" "$(cat "$cache")" "gmail: https://example.com - ok"
+WORKFLOW_MCP_LIST="echo changed" sh "$here/connectors.sh" "$cache" "$work"
+expect "a fresh list is kept" "$(cat "$cache")" "gmail: https://example.com - ok"
+rm "$cache"
+WORKFLOW_MCP_LIST=false sh "$here/connectors.sh" "$cache" "$work"
+expect "a failed list writes nothing" "$([ -e "$cache" ] && echo written)" ""
+mkdir "$cache.lock"
+sh "$here/connectors.sh" "$cache" "$work"
+expect "a held lock skips the run" "$([ -e "$cache" ] && echo written)" ""
+rmdir "$cache.lock"
+sh "$here/connectors.sh" "$cache" "$work"
+expect "and the lock is given back" "$([ -e "$cache.lock" ] && echo held)" ""
+unset WORKFLOW_MCP_LIST
 
 exit "$failed"

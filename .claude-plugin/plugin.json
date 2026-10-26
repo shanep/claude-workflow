@@ -1,7 +1,7 @@
 {
   "name": "workflow",
   "displayName": "Workflow",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "types": "./types/index.d.ts",
   "description": "Keep parallel Claude Code sessions in one repo out of each other's files and ports, set up new worktrees, take turns at checks, check the repo at startup, keep noisy output out of the conversation and run a plan of tasks as background sessions",
   "author": {

@@ -44,6 +44,11 @@ export type Pause = { file: string; at: number }
 // milliseconds, and its problems. None means the repo is healthy at head.
 export type Health = { at: number; problems: string[] }
 
+// What `claude mcp list` last said about the MCP servers and connectors:
+// when it ran, how many are connected and each one that is not, as
+// "<name>: <status>".
+export type Connectors = { at: number; ready: number; problems: string[] }
+
 // One task of a plan, as the pane lists it.
 export type PlanTaskView = {
   id: string
@@ -96,6 +101,8 @@ export type Repo = {
   // What auto mode let through and refused in this session, the newest last,
   // or null before it decided anything.
   audit: { allowed: number; denied: number; recent: AuditEntry[] } | null
+  // Null until the first list is done.
+  connectors: Connectors | null
 }
 
 declare module 'claude-code' {
