@@ -4,7 +4,8 @@ A Claude Code plugin that keeps parallel sessions in one git repo out of each
 other's files and ports, and keeps their checks from swamping the machine. Run a few sessions at once, in the main checkout or
 in worktrees, and each one knows what the others are changing.
 
-It is three hooks, a startup script and some files in `.git`. There are no
+It is three hooks, a startup script, two skills, two agents and some files
+in `.git`. There are no
 timers and no server, and every hook lets the call through if it breaks, so a
 bad check never stops your work.
 
@@ -50,6 +51,13 @@ claude plugin install workflow@shanep
   150 on 10 cores and every one crawled, so taking turns gets each done
   sooner. Set `WORKFLOW_CHECK_SLOTS` to change the limit. A check that waits
   over 10 minutes runs anyway, and Claude hears how long it waited.
+- **Keeps noisy work out of the conversation.** Two skills and two agents
+  keep long output from filling Claude's context. `/workflow:quiet-run` runs a
+  build or test suite into a log and brings back only the errors.
+  `/workflow:dev-server` starts a dev server in the background on the
+  session's own port and waits until it answers. The `scout` agent searches
+  the repo and reports only what matters, and `ci-watch` waits for a GitHub
+  Actions run and reports the result.
 
 ## How it works
 
