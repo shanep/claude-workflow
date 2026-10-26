@@ -1,6 +1,6 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Health, Pause, PlanTaskView, PlanView, Progress } from '../types'
+import type { AuditEntry, Health, Pause, PlanTaskView, PlanView, Progress } from '../types'
 
 // Lets several Claude Code sessions work in one repo at once, ported from
 // Overlord and cut down to three hooks with no timers, no server and no fetch.
@@ -42,6 +42,10 @@ import type { Health, Pause, PlanTaskView, PlanView, Progress } from '../types'
 // computer from sleeping until its Claude Code process exits, so long work and
 // plans finish overnight. The display still turns off. WORKFLOW_KEEP_AWAKE=0
 // turns it off.
+//
+// Audit. Every call auto mode's classifier let through or refused goes in
+// ~/.claude/workflow/audit/<session id>.json, so you can look back at what ran
+// without you. /audit lists them. See the Audit section below.
 //
 // Plans. /workflow:plan splits a goal into tasks, and each task runs as a
 // background session in its own worktree once the tasks it depends on have
@@ -189,6 +193,8 @@ function forget(): void {
   progress = null
   isBudgetTold = false
   planBudget = undefined
+  asked = new Set()
+  auditing = undefined
 }
 
 // A command's output, or null when it fails. Git never stops to ask for a password.
@@ -493,6 +499,7 @@ async function publish($: EngineInterface, place: Place): Promise<void> {
     plans,
     progress,
     isAwake: await awake($),
+    audit: await auditView(),
   })
 }
 
@@ -1185,14 +1192,158 @@ async function planTool($: EngineInterface, input: Readonly<Record<string, unkno
   return planLines(await viewPlan($, dir, plan, await costs($, place)))
 }
 
+// Audit. The permission check answers ask for a call no rule or mode settles,
+// which puts it to the mode's decider. In auto mode that is the classifier, so
+// an asked call that then runs is one auto mode let through. A refusal comes
+// as its own event. Each session keeps its own file, so no two write the same
+// one, and files older than AUDIT_DAYS are removed.
+
+const MAX_AUDIT = 500
+const AUDIT_DAYS = 30
+const MAX_WHAT = 160
+const PANE_AUDIT = 3
+
+// The calls the permission check put to the mode's decider, by tool_use_id.
+let asked = new Set<string>()
+// This session's audit, the newest last, loaded on the first entry.
+let auditing: Promise<AuditEntry[]> | undefined
+
+// A call's command, file or URL on one short line.
+function what(input: unknown): string {
+  const args = (typeof input === 'object' && input !== null ? input : {}) as Record<string, unknown>
+  const key = ['command', 'file_path', 'notebook_path', 'url', 'pattern', 'prompt'].find(name => typeof args[name] === 'string')
+  const said = key === undefined ? (JSON.stringify(input) ?? '') : String(args[key])
+  const line = said.replace(/\s+/g, ' ').trim()
+  return line.length > MAX_WHAT ? `${line.slice(0, MAX_WHAT - 3)}...` : line
+}
+
+async function auditDir($: EngineInterface): Promise<string | null> {
+  const dir = await shared($)
+  return dir === null ? null : `${dir}/audit`
+}
+
+// The audit so far, read back after a reload. Old files go first.
+async function loadAudit($: EngineInterface, dir: string, file: string): Promise<AuditEntry[]> {
+  await run($, '/', ['mkdir', '-p', dir])
+  await run($, dir, ['find', '.', '-name', '*.json', '-mtime', `+${AUDIT_DAYS}`, '-exec', 'rm', '-f', '{}', '+'])
+  const found = await readJson($, file)
+  return Array.isArray(found) ? (found as AuditEntry[]) : []
+}
+
+// Adds an entry and writes the file. Entries chain, so parallel calls never
+// drop one another's.
+async function record($: EngineInterface, entry: AuditEntry): Promise<void> {
+  const dir = await auditDir($)
+  if (dir === null) {
+    return
+  }
+  const file = `${dir}/${await $.session.id()}.json`
+  auditing = (auditing ?? loadAudit($, dir, file)).then(async list => {
+    const kept = [...list, entry].slice(-MAX_AUDIT)
+    try {
+      await $.fs.write(file, JSON.stringify(kept))
+    } catch {
+      // The next entry writes the whole list again.
+    }
+    return kept
+  })
+  await auditing
+  const place = await ready($)
+  if (place !== null) {
+    await publish($, place)
+  }
+}
+
+async function auditView(): Promise<{ allowed: number; denied: number; recent: AuditEntry[] } | null> {
+  if (auditing === undefined) {
+    return null
+  }
+  const list = await auditing
+  const allowed = list.filter(entry => entry.decision === 'allow').length
+  return { allowed, denied: list.length - allowed, recent: list.slice(-PANE_AUDIT) }
+}
+
+// How long ago, as "5m", "3h 20m" or "2d". The plugin has no time zone to print a clock time in.
+function ago(ms: number): string {
+  const minutes = Math.max(0, Math.floor(ms / 60_000))
+  if (minutes < 60) {
+    return `${minutes}m`
+  }
+  const hours = Math.floor(minutes / 60)
+  return hours < 24 ? `${hours}h ${minutes % 60}m` : `${Math.floor(hours / 24)}d`
+}
+
+function auditLine(entry: AuditEntry, now: number): string {
+  const when = `${ago(now - entry.at)} ago`
+  const verb = entry.decision === 'allow' ? 'let through' : 'refused'
+  const by = entry.agent === null ? '' : ` (subagent ${entry.agent})`
+  const why = entry.reason === null ? '' : `\n    ${entry.reason.split('\n')[0]}`
+  return `${when} ${verb} ${entry.tool}${by}: ${entry.what}${why}`
+}
+
+// Answers /audit: this session's entries, or with "all" every session's from the last day.
+async function listAudit($: EngineInterface, args: string): Promise<string> {
+  const dir = await auditDir($)
+  if (dir === null) {
+    return 'The audit has no folder, since HOME is not set.'
+  }
+  const now = await $.clock.now()
+  let entries: AuditEntry[]
+  if (args.trim() === 'all') {
+    const files = (await $.fs.exists(dir)) ? await $.fs.list(dir) : []
+    const lists = await Promise.all(
+      files.filter(file => file.name.endsWith('.json') && now - file.mtimeMs < 24 * 3_600_000).map(file => readJson($, `${dir}/${file.name}`)),
+    )
+    entries = lists.flatMap(list => (Array.isArray(list) ? (list as AuditEntry[]) : [])).filter(entry => now - entry.at < 24 * 3_600_000)
+  } else {
+    entries = auditing === undefined ? await loadAudit($, dir, `${dir}/${await $.session.id()}.json`) : await auditing
+  }
+  const shown = entries.sort((a, b) => a.at - b.at).slice(-40)
+  if (shown.length === 0) {
+    return args.trim() === 'all' ? 'Auto mode decided nothing in the last day.' : 'Auto mode has decided nothing in this session yet. /audit all lists the last day across sessions.'
+  }
+  const more = entries.length - shown.length
+  return [...(more > 0 ? [`${more} older entries not shown.`] : []), ...shown.map(entry => auditLine(entry, now))].join('\n')
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.tool.register(PLAN_TOOL)
+    await $.command.register({ name: 'audit', description: 'List what auto mode let through or refused', argumentHint: '[all]' })
     await $.command.register({ name: 'budget', description: 'Set this session\'s spending budget in dollars, or clear it', argumentHint: '<dollars> | off' })
     return next(e)
   }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'budget' }, async ($, e) => ({ text: await setBudget($, e.args) }))
+  on('command.run', { command: 'audit' }, async ($, e) => ({ text: await listAudit($, e.args) }))
+
+  // Notes the calls the permission check put to the mode's decider. A
+  // plugin's ask goes to a person instead, so it is left out.
+  on('tool.check', async ($, e, next) => {
+    const verdict = await next(e)
+    if (verdict.decision === 'ask' && verdict.plugin === undefined && e.tool_use_id !== undefined) {
+      // Calls that never finish would pile up otherwise.
+      if (asked.size > 1000) {
+        asked = new Set()
+      }
+      asked.add(e.tool_use_id)
+    }
+    return verdict
+  }).catch(($, e, next) => next(e))
+
+  // An asked call that ran in auto mode is one the classifier let through.
+  on('classic.PostToolUse', async ($, e, next) => {
+    if (asked.delete(e.tool_use_id) && e.permission_mode === 'auto') {
+      await record($, { at: await $.clock.now(), tool: e.tool_name, what: what(e.tool_input), decision: 'allow', reason: null, agent: e.agent_id ?? null, cwd: e.cwd })
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  on('classic.PermissionDenied', async ($, e, next) => {
+    asked.delete(e.tool_use_id)
+    await record($, { at: await $.clock.now(), tool: e.tool_name, what: what(e.tool_input), decision: 'deny', reason: e.reason, agent: e.agent_id ?? null, cwd: e.cwd })
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   on('session.end', async ($, e, next) => {
     // A session that never looked has nothing to remove and nothing to set up.

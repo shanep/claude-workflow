@@ -56,6 +56,10 @@ claude plugin install workflow@shanep
   and plans finish overnight. The display still turns off. It uses
   `caffeinate` on macOS and `systemd-inhibit` on Linux. Set
   `WORKFLOW_KEEP_AWAKE=0` to turn it off.
+- **Audits auto mode.** Every call auto mode's classifier lets through or
+  refuses goes in a log, so you can look back at what ran without you.
+  `/audit` lists this session's and `/audit all` every session's from the
+  last day, and the /boom pane shows the newest few.
 - **Keeps noisy work out of the conversation.** Two skills and two agents
   keep long output from filling Claude's context. `/workflow:quiet-run` runs a
   build or test suite into a log and brings back only the errors.
@@ -110,6 +114,14 @@ a crash never leaves the computer awake. `scripts/awake.sh` starts one per
 process and notes it under `~/.claude/workflow/awake/`, so a reload or
 `/clear` does not start a second.
 
+The audit counts a call as auto mode's when the permission check found no
+rule or mode that settles it (the point where Claude Code would otherwise ask
+you), the session runs in auto mode, and the call then ran. A refusal comes
+as its own event. Each session keeps its own file under
+`~/.claude/workflow/audit/`, the newest 500 entries, and files older than 30
+days are removed. Commands are kept as Claude ran them, so the log holds
+whatever the commands held.
+
 A plan is a folder under `.git/workflow/plans/<plan id>/` with the tasks in
 `plan.json`. There is no runner process. A task's session ends by saying
 `LANDED <sha>` or `FAILED <reason>`, and when its turn ends the plugin checks
@@ -132,8 +144,8 @@ The plugin keeps what it knows in `$.state` under `workflow.repo`: the
 checkout, the target branch, this session's files, the other sessions, recent
 pauses, the upstream files to rebase on, the port base, how the worktree setup
 went, how many check slots are busy, what the startup check found, whether it
-keeps the computer awake, the newest plans with what each task cost, and this
-session's progress and budget.
+keeps the computer awake, what auto mode decided, the newest plans with what
+each task cost, and this session's progress and budget.
 `types/index.d.ts` has the shape. Copy the `Repo` type into your own contract
 instead of listing `workflow` under `dependencies`, since a missing dependency
 turns your whole plugin off. The `/boom` pane in

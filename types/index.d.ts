@@ -13,6 +13,20 @@ export type Progress = {
   fiveHour: number | null
 }
 
+// A call auto mode let through or refused, as the audit keeps it.
+export type AuditEntry = {
+  at: number
+  tool: string
+  // The command, file or URL, cut to one short line.
+  what: string
+  decision: 'allow' | 'deny'
+  // Why auto mode refused it, or null for one it let through.
+  reason: string | null
+  // The subagent that made the call, or null for the main loop.
+  agent: string | null
+  cwd: string
+}
+
 // Another session in the repo, as the pane lists it.
 export type Peer = {
   topic: string | null
@@ -79,6 +93,9 @@ export type Repo = {
   progress: Progress | null
   // Whether this session keeps the computer from sleeping.
   isAwake: boolean
+  // What auto mode let through and refused in this session, the newest last,
+  // or null before it decided anything.
+  audit: { allowed: number; denied: number; recent: AuditEntry[] } | null
 }
 
 declare module 'claude-code' {
