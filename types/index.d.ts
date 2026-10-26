@@ -13,6 +13,25 @@ export type Pause = { file: string; at: number }
 // milliseconds, and its problems. None means the repo is healthy at head.
 export type Health = { at: number; problems: string[] }
 
+// One task of a plan, as the pane lists it.
+export type PlanTaskView = {
+  id: string
+  title: string
+  state: 'waiting' | 'running' | 'landed' | 'failed' | 'stopped'
+  // The landed commit or why it failed, or null.
+  note: string | null
+  // The background session's name, or null before it starts.
+  session: string | null
+}
+
+// A plan the /workflow:plan skill started, newest first in Repo.
+export type PlanView = {
+  id: string
+  goal: string
+  state: 'running' | 'done' | 'failed' | 'stopped'
+  tasks: PlanTaskView[]
+}
+
 // What this session knows about its repo. Other plugins (the drboom pane)
 // read it, so a change here is a change to their contract too.
 export type Repo = {
@@ -35,6 +54,8 @@ export type Repo = {
   checks: { busy: number; slots: number } | null
   // Null until health.sh is done.
   health: Health | null
+  // The repo's newest plans, newest first.
+  plans: PlanView[]
 }
 
 declare module 'claude-code' {

@@ -4,8 +4,8 @@ A Claude Code plugin that keeps parallel sessions in one git repo out of each
 other's files and ports, and keeps their checks from swamping the machine. Run a few sessions at once, in the main checkout or
 in worktrees, and each one knows what the others are changing.
 
-It is three hooks, a startup script, two skills, two agents and some files
-in `.git`. There are no
+It is five hooks, a tool, a startup script, three skills, two agents and some
+files in `.git`. There are no
 timers and no server, and every hook lets the call through if it breaks, so a
 bad check never stops your work.
 
@@ -58,6 +58,13 @@ claude plugin install workflow@shanep
   session's own port and waits until it answers. The `scout` agent searches
   the repo and reports only what matters, and `ci-watch` waits for a GitHub
   Actions run and reports the result.
+- **Runs a plan across sessions.** `/workflow:plan <goal>` reads the repo and
+  splits the goal into at most 12 tasks, each with what it depends on and the
+  files it will likely change. You click Start, Change or Cancel. On Start each
+  task runs as a background session in its own worktree (`claude --bg -w`)
+  once the tasks it depends on have landed, and the /boom pane follows them.
+  `/workflow:plan stop <plan>` stops one and `/workflow:plan retry <plan>
+  <task>` starts a task again.
 
 ## How it works
 
@@ -86,12 +93,23 @@ starts before the command and kills once it is done. The command itself is
 never changed, so your permission rules see it as written. The holder also
 exits if Claude Code does, so a crash or Esc never leaves a slot taken.
 
+A plan is a folder under `.git/workflow/plans/<plan id>/` with the tasks in
+`plan.json`. There is no runner process. A task's session ends by saying
+`LANDED <sha>` or `FAILED <reason>`, and when its turn ends the plugin checks
+that the commit is on the default branch, writes down how it went and starts
+the tasks that just became due. Any other session in the repo also starts
+what is due when it looks, in case a session died before it could. A task
+starts once, since only one session gets to `mkdir` its marker. A task whose
+session ends without either line stays running until you retry it or stop
+the plan.
+
 ## For other plugins
 
 The plugin keeps what it knows in `$.state` under `workflow.repo`: the
 checkout, the target branch, this session's files, the other sessions, recent
 pauses, the upstream files to rebase on, the port base, how the worktree setup
-went, how many check slots are busy and what the startup check found.
+went, how many check slots are busy, what the startup check found and the
+newest plans.
 `types/index.d.ts` has the shape. Copy the `Repo` type into your own contract
 instead of listing `workflow` under `dependencies`, since a missing dependency
 turns your whole plugin off. The `/boom` pane in

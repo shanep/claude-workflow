@@ -1,6 +1,6 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Health, Pause } from '../types'
+import type { Health, Pause, PlanTaskView, PlanView } from '../types'
 
 // Lets several Claude Code sessions work in one repo at once, ported from
 // Overlord and cut down to three hooks with no timers, no server and no fetch.
@@ -31,6 +31,10 @@ import type { Health, Pause } from '../types'
 // so a dozen sessions testing at once do not slow every one of them to a
 // crawl. The hook waits before the command runs and frees the slot after, so
 // the command itself is never changed and permission rules see it as written.
+//
+// Plans. /workflow:plan splits a goal into tasks, and each task runs as a
+// background session in its own worktree once the tasks it depends on have
+// landed. See the Plans section below.
 //
 // A session counts while its Claude Code process runs. Every hook lets its
 // call through when it throws, so a broken check never stops work. What it
@@ -112,6 +116,8 @@ let told: string | null = null
 let setup: string | null = null
 let toldSetup = false
 let toldPorts = false
+// The repo's newest plans, read when the session looks.
+let plans: PlanView[] = []
 // Each file and set of peers already paused once.
 let paused = new Set<string>()
 // The last few pauses, newest first, for the pane.
@@ -137,6 +143,7 @@ function forget(): void {
   paused = new Set()
   pauses = []
   noticed = new Set()
+  plans = []
 }
 
 // A command's output, or null when it fails. Git never stops to ask for a password.
@@ -273,6 +280,7 @@ async function look($: EngineInterface, place: Place): Promise<void> {
   const count = dir === null ? null : await run($, '/', ['sh', `${$.plugin.root}/scripts/turn.sh`, `${dir}/checks`, 'count'])
   const [busy, slots] = (count ?? '').split(' ').map(Number)
   health = await readHealth($, place)
+  plans = await readPlans($, place)
   checks = busy === undefined || slots === undefined || Number.isNaN(busy) || Number.isNaN(slots) ? null : { busy, slots }
 }
 
@@ -418,6 +426,7 @@ async function publish($: EngineInterface, place: Place): Promise<void> {
     health,
     ports: slot === null ? null : PORT_BASE + slot * PORT_STEP,
     setup,
+    plans,
   })
 }
 
@@ -530,7 +539,444 @@ async function pause($: EngineInterface, place: Place, relative: string): Promis
   ].join('\n')
 }
 
+// Plans. The /workflow:plan skill drafts tasks with the person and hands them
+// to the plan tool, which saves them under <git common dir>/workflow/plans/<id>/
+// and starts each task whose dependencies have landed as a background session
+// in its own worktree (claude --bg -w). There is no runner process: the
+// session that finishes a task records how it went and starts what that
+// unblocked, and any session in the repo starts what is due when it looks. A
+// task starts once, since only one session gets to mkdir its marker.
+//
+// - plan.json holds the goal and the tasks, and is never written again.
+// - <task>.started is the marker, and its session file names the session.
+// - <task>.tries counts the starts, so a retried task gets a fresh worktree.
+// - <task>.json is how it went: landed when the session ends with LANDED <sha>
+//   and that commit is on the default branch, failed when it ends with FAILED.
+// - stopped means the plan was stopped, and nothing more starts.
+
+interface Task {
+  readonly id: string
+  readonly title: string
+  // What the task's session is told. It sees nothing else of the plan.
+  readonly prompt: string
+  readonly dependsOn: readonly string[]
+  readonly files: readonly string[]
+}
+
+interface Plan {
+  readonly id: string
+  readonly goal: string
+  readonly summary: string
+  readonly createdAt: number
+  readonly tasks: readonly Task[]
+}
+
+interface Outcome {
+  readonly state: 'landed' | 'failed'
+  readonly sha: string | null
+  readonly note: string | null
+  readonly at: number
+}
+
+// The session a task runs in: its background id and its name.
+interface Started {
+  readonly bg: string | null
+  readonly name: string
+}
+
+const MAX_TASKS = 12
+// The pane shows this many plans.
+const MAX_PLANS = 3
+const TASK_ID = /^[a-z0-9][a-z0-9-]{0,30}$/
+const PLAN_ID = /^[a-z0-9]{1,16}$/
+
+function plansDir(place: Place): string {
+  return `${place.common}/workflow/plans`
+}
+
+// The main checkout, where task sessions start their worktrees from.
+function mainOf(place: Place): string {
+  return place.common.endsWith('/.git') ? place.common.slice(0, -'/.git'.length) : place.root
+}
+
+function strings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+}
+
+// The tasks the model gave, or why they do not fit.
+function parseTasks(value: unknown): Task[] | string {
+  if (!Array.isArray(value) || value.length === 0) {
+    return 'tasks must be a list of at least one task.'
+  }
+  if (value.length > MAX_TASKS) {
+    return `A plan has at most ${MAX_TASKS} tasks.`
+  }
+  const tasks: Task[] = []
+  for (const item of value as unknown[]) {
+    const task = (typeof item === 'object' && item !== null ? item : {}) as Partial<Record<keyof Task, unknown>>
+    const { id, title, prompt } = task
+    if (typeof id !== 'string' || !TASK_ID.test(id)) {
+      return `Task id ${JSON.stringify(id)} must be short lowercase words with hyphens.`
+    }
+    if (typeof title !== 'string' || title.trim() === '' || typeof prompt !== 'string' || prompt.trim() === '') {
+      return `Task ${id} needs a title and a prompt.`
+    }
+    tasks.push({ id, title: title.trim(), prompt: prompt.trim(), dependsOn: strings(task.dependsOn), files: strings(task.files) })
+  }
+  return tidy(tasks)
+}
+
+// Drops duplicate ids and unknown or self dependencies, breaks any loop by
+// dropping the dependency that closes it, and orders the tasks so each comes
+// after the ones it depends on. Ported from Overlord.
+function tidy(given: readonly Task[]): Task[] {
+  const seen = new Set<string>()
+  const tasks = given.filter(task => {
+    const fresh = !seen.has(task.id)
+    seen.add(task.id)
+    return fresh
+  })
+  const byId = new Map(tasks.map(task => [task.id, task]))
+  const ordered: Task[] = []
+  const done = new Set<string>()
+  const visiting = new Set<string>()
+  const visit = (task: Task): void => {
+    visiting.add(task.id)
+    const dependsOn: string[] = []
+    for (const dep of new Set(task.dependsOn)) {
+      const dependency = byId.get(dep)
+      // Unknown, itself, or a loop back to a task still being visited.
+      if (dependency === undefined || visiting.has(dep)) {
+        continue
+      }
+      if (!done.has(dep)) {
+        visit(dependency)
+      }
+      dependsOn.push(dep)
+    }
+    visiting.delete(task.id)
+    done.add(task.id)
+    ordered.push({ ...task, dependsOn })
+  }
+  for (const task of tasks) {
+    if (!done.has(task.id)) {
+      visit(task)
+    }
+  }
+  return ordered
+}
+
+async function readJson($: EngineInterface, file: string): Promise<unknown> {
+  try {
+    return (await $.fs.exists(file)) ? (JSON.parse(await $.fs.read(file)) as unknown) : null
+  } catch {
+    // Caught halfway through a write, so it shows next time.
+    return null
+  }
+}
+
+async function readPlan($: EngineInterface, dir: string): Promise<Plan | null> {
+  const plan = (await readJson($, `${dir}/plan.json`)) as Partial<Plan> | null
+  return plan !== null && typeof plan.id === 'string' && typeof plan.goal === 'string' && Array.isArray(plan.tasks) ? (plan as Plan) : null
+}
+
+async function readOutcome($: EngineInterface, dir: string, task: string): Promise<Outcome | null> {
+  const outcome = (await readJson($, `${dir}/${task}.json`)) as Partial<Outcome> | null
+  return outcome !== null && (outcome.state === 'landed' || outcome.state === 'failed') ? (outcome as Outcome) : null
+}
+
+async function readStarted($: EngineInterface, dir: string, task: string): Promise<Started | null> {
+  const marker = `${dir}/${task}.started`
+  if (!(await $.fs.exists(marker))) {
+    return null
+  }
+  const file = `${marker}/session`
+  const [bg, name] = (await $.fs.exists(file)) ? (await $.fs.read(file)).split('\n') : []
+  return { bg: bg === undefined || bg === '' ? null : bg, name: name ?? task }
+}
+
+// What a task's session is told: its own prompt, then how to finish.
+function taskPrompt(plan: Plan, task: Task, target: string): string {
+  return `${task.prompt}
+
+This is one task of a larger plan ("${plan.goal}"). Other sessions work on the other tasks at the same time in their own worktrees, so stay within this task.
+
+When it is done and its checks pass, commit it and land it on ${target} the way your instructions say. Then end your last message with a line of its own: LANDED followed by the commit hash on ${target}. If you cannot finish, end with a line FAILED followed by one sentence on why.`
+}
+
+// Starts a task's background session, or records that it could not start.
+async function launch($: EngineInterface, place: Place, dir: string, plan: Plan, task: Task): Promise<void> {
+  const triesFile = `${dir}/${task.id}.tries`
+  const tries = 1 + ((await $.fs.exists(triesFile)) ? Number(await $.fs.read(triesFile)) || 0 : 0)
+  await $.fs.write(triesFile, String(tries))
+  const name = tries === 1 ? `plan-${plan.id}-${task.id}` : `plan-${plan.id}-${task.id}-${tries}`
+  const prompt = taskPrompt(plan, task, place.target ?? 'the default branch')
+  let said = ''
+  try {
+    const ran = await $.process.run(['claude', '--bg', '-w', name, '-n', name, prompt], { cwd: mainOf(place), timeoutMs: 60_000 })
+    said = `${ran.stdout}\n${ran.stderr}`.trim()
+    const bg = ran.exitCode === 0 ? /backgrounded\s+\S+\s+([0-9a-f]+)/.exec(said)?.[1] : undefined
+    if (bg !== undefined) {
+      await $.fs.write(`${dir}/${task.id}.started/session`, `${bg}\n${name}`)
+      return
+    }
+  } catch (error) {
+    said = String(error)
+  }
+  const why = said.split('\n').find(line => line.trim() !== '') ?? 'no output'
+  await writeOutcome($, dir, task.id, { state: 'failed', sha: null, note: `Its session did not start: ${why}`, at: await $.clock.now() })
+}
+
+async function writeOutcome($: EngineInterface, dir: string, task: string, outcome: Outcome): Promise<void> {
+  await $.fs.write(`${dir}/${task}.json`, JSON.stringify(outcome))
+}
+
+// Starts every task of the plan whose dependencies have all landed and that
+// has not started yet.
+async function advance($: EngineInterface, place: Place, planId: string): Promise<void> {
+  const dir = `${plansDir(place)}/${planId}`
+  const plan = await readPlan($, dir)
+  if (plan === null || (await $.fs.exists(`${dir}/stopped`))) {
+    return
+  }
+  const outcomes = new Map<string, Outcome>()
+  for (const task of plan.tasks) {
+    const outcome = await readOutcome($, dir, task.id)
+    if (outcome !== null) {
+      outcomes.set(task.id, outcome)
+    }
+  }
+  for (const task of plan.tasks) {
+    const isDue = !outcomes.has(task.id) && task.dependsOn.every(dep => outcomes.get(dep)?.state === 'landed')
+    // mkdir fails when the marker is there, so only one session starts the task.
+    if (isDue && !(await $.fs.exists(`${dir}/${task.id}.started`)) && (await run($, dir, ['mkdir', `${task.id}.started`])) !== null) {
+      await launch($, place, dir, plan, task)
+    }
+  }
+}
+
+// How a plan stands, for the pane and the plan tool.
+async function viewPlan($: EngineInterface, dir: string, plan: Plan): Promise<PlanView> {
+  const isStopped = await $.fs.exists(`${dir}/stopped`)
+  const tasks: PlanTaskView[] = []
+  for (const task of plan.tasks) {
+    const outcome = await readOutcome($, dir, task.id)
+    const started = await readStarted($, dir, task.id)
+    const state = outcome !== null ? outcome.state : isStopped ? 'stopped' : started !== null ? 'running' : 'waiting'
+    const note = outcome === null ? null : outcome.state === 'landed' ? (outcome.sha?.slice(0, 7) ?? null) : outcome.note
+    tasks.push({ id: task.id, title: task.title, state, note, session: started?.name ?? null })
+  }
+  const state = isStopped
+    ? 'stopped'
+    : tasks.every(task => task.state === 'landed')
+      ? 'done'
+      : tasks.some(task => task.state === 'failed') && !tasks.some(task => task.state === 'running')
+        ? 'failed'
+        : 'running'
+  return { id: plan.id, goal: plan.goal, state, tasks }
+}
+
+// The repo's newest plans, after starting what is due in the running ones.
+async function readPlans($: EngineInterface, place: Place): Promise<PlanView[]> {
+  const root = plansDir(place)
+  if (!(await $.fs.exists(root))) {
+    return []
+  }
+  const ids = (await $.fs.list(root))
+    .filter(entry => entry.kind === 'dir' && PLAN_ID.test(entry.name))
+    .map(entry => entry.name)
+    // Ids are the time they were made in base 36, so they sort by age.
+    .sort((a, b) => b.length - a.length || b.localeCompare(a))
+    .slice(0, MAX_PLANS)
+  const views: PlanView[] = []
+  for (const planId of ids) {
+    const dir = `${root}/${planId}`
+    const plan = await readPlan($, dir)
+    if (plan === null) {
+      continue
+    }
+    let view = await viewPlan($, dir, plan)
+    if (view.state === 'running') {
+      await advance($, place, planId)
+      view = await viewPlan($, dir, plan)
+    }
+    views.push(view)
+  }
+  return views
+}
+
+// The plan task this session runs, found by its session id or worktree name.
+async function ownTask($: EngineInterface, place: Place): Promise<{ readonly dir: string; readonly task: string } | null> {
+  const root = plansDir(place)
+  const folder = place.root.split('/').at(-1) ?? ''
+  if (place.isMain || !folder.startsWith('plan-') || !(await $.fs.exists(root))) {
+    return null
+  }
+  for (const planDir of await $.fs.list(root)) {
+    if (planDir.kind !== 'dir') {
+      continue
+    }
+    const dir = `${root}/${planDir.name}`
+    for (const entry of await $.fs.list(dir)) {
+      if (entry.kind !== 'dir' || !entry.name.endsWith('.started')) {
+        continue
+      }
+      const task = entry.name.slice(0, -'.started'.length)
+      const started = await readStarted($, dir, task)
+      if (started !== null && (started.name === folder || (started.bg !== null && id.startsWith(started.bg)))) {
+        return { dir, task }
+      }
+    }
+  }
+  return null
+}
+
+// Records how this session's plan task went, when its answer says, and
+// starts what that unblocked.
+async function finish($: EngineInterface, place: Place, answer: string): Promise<void> {
+  let said: { sha: string } | { why: string } | null = null
+  for (const line of answer.trim().split('\n').reverse()) {
+    const landed = /^\W*LANDED\s+([0-9a-f]{7,40})\b/.exec(line)
+    const failed = /^\W*FAILED\s+(.+)$/.exec(line)
+    said = landed?.[1] !== undefined ? { sha: landed[1] } : failed?.[1] !== undefined ? { why: failed[1].trim() } : null
+    if (said !== null) {
+      break
+    }
+  }
+  const mine = said === null ? null : await ownTask($, place)
+  if (said === null || mine === null || (await readOutcome($, mine.dir, mine.task)) !== null) {
+    return
+  }
+  const at = await $.clock.now()
+  let outcome: Outcome
+  if ('why' in said) {
+    outcome = { state: 'failed', sha: null, note: said.why, at }
+  } else if (place.target === null) {
+    outcome = { state: 'failed', sha: said.sha, note: 'origin has no default branch to check the commit against.', at }
+  } else {
+    await run($, place.root, ['git', 'fetch', '-q', 'origin', place.target], 60_000)
+    const isLanded = (await run($, place.root, ['git', 'merge-base', '--is-ancestor', said.sha, `origin/${place.target}`])) !== null
+    outcome = isLanded
+      ? { state: 'landed', sha: said.sha, note: null, at }
+      : { state: 'failed', sha: said.sha, note: `It said it landed ${said.sha.slice(0, 7)}, but that commit is not on ${place.target}.`, at }
+  }
+  await writeOutcome($, mine.dir, mine.task, outcome)
+  await advance($, place, mine.dir.split('/').at(-1) ?? '')
+  lookedAt = 0
+  await look($, place)
+  await publish($, place)
+}
+
+// What the plan tool takes, for the model.
+const PLAN_TOOL = {
+  name: 'plan',
+  description:
+    'Runs a plan of tasks as background Claude Code sessions, each in its own git worktree, starting each task once the tasks it depends on have landed. Only call it from the /workflow:plan skill, after the person approved the plan. action "start" takes goal, summary and tasks; "stop" takes plan; "retry" takes plan and task and starts that task again.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      action: { type: 'string', enum: ['start', 'stop', 'retry'] },
+      goal: { type: 'string', description: 'The goal in the person\'s words.' },
+      summary: { type: 'string', description: 'One short paragraph on how the work was split.' },
+      tasks: {
+        type: 'array',
+        maxItems: MAX_TASKS,
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'Short lowercase words with hyphens, unique in the plan.' },
+            title: { type: 'string' },
+            prompt: { type: 'string', description: 'Everything the task\'s session needs, since it sees nothing else.' },
+            dependsOn: { type: 'array', items: { type: 'string' } },
+            files: { type: 'array', items: { type: 'string' } },
+          },
+          required: ['id', 'title', 'prompt', 'dependsOn', 'files'],
+        },
+      },
+      plan: { type: 'string', description: 'The plan id, for stop and retry.' },
+      task: { type: 'string', description: 'The task id, for retry.' },
+    },
+    required: ['action'],
+  },
+  isDeferred: true,
+} as const
+
+function planLines(view: PlanView): string {
+  return [
+    `Plan ${view.id} (${view.state}): ${view.goal}`,
+    ...view.tasks.map(task => `- ${task.id}: ${task.state}${task.note === null ? '' : ` (${task.note})`}${task.session === null ? '' : `, session ${task.session}`}`),
+  ].join('\n')
+}
+
+// Answers a call to the plan tool with what it did, or throws why it could not.
+async function planTool($: EngineInterface, input: Readonly<Record<string, unknown>>): Promise<string> {
+  const place = await ready($)
+  if (place === null) {
+    throw new Error('This session is not in a git repository.')
+  }
+  if (place.target === null) {
+    throw new Error('origin has no default branch, so landings cannot be checked. Run git remote set-head origin --auto first.')
+  }
+  const root = plansDir(place)
+  const planId = typeof input.plan === 'string' && PLAN_ID.test(input.plan) ? input.plan : null
+  const dir = planId === null ? null : `${root}/${planId}`
+  const plan = dir === null ? null : await readPlan($, dir)
+  if (input.action === 'start') {
+    const tasks = parseTasks(input.tasks)
+    if (typeof tasks === 'string') {
+      throw new Error(tasks)
+    }
+    if (typeof input.goal !== 'string' || input.goal.trim() === '') {
+      throw new Error('A plan needs a goal.')
+    }
+    const createdAt = await $.clock.now()
+    const made: Plan = { id: createdAt.toString(36), goal: input.goal.trim(), summary: typeof input.summary === 'string' ? input.summary : '', createdAt, tasks }
+    await $.fs.write(`${root}/${made.id}/plan.json`, JSON.stringify(made, null, 2))
+    await advance($, place, made.id)
+    lookedAt = 0
+    await look($, place)
+    await publish($, place)
+    const view = await viewPlan($, `${root}/${made.id}`, made)
+    return `${planLines(view)}\n\nRunning tasks land on their own, and the rest start as the tasks they depend on land. The /boom pane shows the plan.`
+  }
+  if (dir === null || plan === null) {
+    throw new Error(`No plan ${JSON.stringify(input.plan)} in this repository.`)
+  }
+  if (input.action === 'stop') {
+    await $.fs.write(`${dir}/stopped`, '')
+    for (const task of plan.tasks) {
+      const started = await readStarted($, dir, task.id)
+      if (started === null || (await readOutcome($, dir, task.id)) !== null) {
+        continue
+      }
+      if (started.bg !== null) {
+        await run($, mainOf(place), ['claude', 'stop', started.bg], 30_000)
+      }
+      // A retry starts it again from scratch.
+      await writeOutcome($, dir, task.id, { state: 'failed', sha: null, note: 'Stopped with the plan.', at: await $.clock.now() })
+    }
+  } else if (input.action === 'retry') {
+    const task = plan.tasks.find(item => item.id === input.task)
+    if (task === undefined) {
+      throw new Error(`Plan ${plan.id} has no task ${JSON.stringify(input.task)}.`)
+    }
+    await run($, dir, ['rm', '-rf', `${task.id}.json`, `${task.id}.started`, 'stopped'])
+    await advance($, place, plan.id)
+  } else {
+    throw new Error('action must be start, stop or retry.')
+  }
+  lookedAt = 0
+  await look($, place)
+  await publish($, place)
+  return planLines(await viewPlan($, dir, plan))
+}
+
 export const register: Register = on => {
+  on('session.start', async ($, e, next) => {
+    await $.tool.register(PLAN_TOOL)
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('session.end', async ($, e, next) => {
     // A session that never looked has nothing to remove and nothing to set up.
     const place = placing === undefined ? null : await placing
@@ -563,8 +1009,18 @@ export const register: Register = on => {
   // Pauses an edit to a file another session is changing and remembers the
   // edits that went through. After a Bash call, which is how commits, rebases
   // and landings happen, it looks at git again and passes on a landing, since
-  // a background session seldom gets a second prompt.
+  // a background session seldom gets a second prompt. It also answers the
+  // plan tool, here and not under a matcher of its own, since the types only
+  // name the tools the session had when the mod was last saved.
   on('tool.call', async ($, e, next) => {
+    // The cast widens the known tool names to compare with the plan tool's.
+    if ((e.tool as string) === `mcp__workflow__${PLAN_TOOL.name}`) {
+      try {
+        return { result: await planTool($, e) }
+      } catch (error) {
+        return { deny: error instanceof Error ? error.message : String(error) }
+      }
+    }
     const file = e.tool === 'Edit' || e.tool === 'Write' ? e.file_path : e.tool === 'NotebookEdit' ? e.notebook_path : null
     if (e.tool === 'Bash') {
       // The ports, for a session that started before the plugin loaded.
@@ -602,5 +1058,14 @@ export const register: Register = on => {
     await save($, place)
     const notes = [waitNote, landingNote(place)].filter((note): note is string => note !== null)
     return notes.length === 0 ? ran : { ...ran, context: [...(ran.context ?? []), ...notes] }
+  }).catch(($, e, next) => next(e))
+
+  // A plan task's session records how its task went when its turn ends.
+  on('turn.complete', async ($, e, next) => {
+    const place = e.agentId === undefined && !e.isAborted ? await ready($) : null
+    if (place !== null) {
+      await finish($, place, e.answer)
+    }
+    return next(e)
   }).catch(($, e, next) => next(e))
 }
