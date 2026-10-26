@@ -9,7 +9,7 @@ Run the command in $ARGUMENTS without flooding the conversation with its output.
 1. Send all output to a log file and keep the exit code. Use the session's scratchpad folder if there is one, otherwise the system temp folder:
 
    ```sh
-   log="${TMPDIR:-/tmp}/quiet-run-$(date +%s).log"
+   log=$(mktemp "${TMPDIR:-/tmp}/quiet-run.XXXXXX")
    ( <command> ) >"$log" 2>&1; status=$?
    echo "exit $status, $(wc -l <"$log" | tr -d ' ') lines in $log"
    ```

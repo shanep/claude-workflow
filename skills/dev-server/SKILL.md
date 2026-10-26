@@ -6,10 +6,10 @@ argument-hint: start|restart|stop <port> [command]
 
 Manage a dev server without blocking the session or flooding it with logs. $ARGUMENTS gives the action, the port and, to start, the command. With no port, use `$WORKFLOW_PORT_BASE`, this session's own port, and say which one you picked.
 
-- Log file: `${TMPDIR:-/tmp}/dev-server-<port>.log`.
-- Free the port: `pids=$(lsof -ti tcp:<port> 2>/dev/null); [ -n "$pids" ] && kill $pids`. Where lsof is missing (some Linux machines), use `fuser -k <port>/tcp`.
-- Start: free the port, then run the command with the Bash tool's run_in_background option and all output going to the log: `<command> >"$log" 2>&1`.
-- Wait until it answers: `curl -s -o /dev/null --retry 60 --retry-delay 1 --retry-connrefused "http://127.0.0.1:<port>/"`. If it never answers, show `tail -n 40 "$log"` and stop.
+- Log file: `${TMPDIR:-/tmp}/dev-server-<port>.log`. Each Bash call is a new shell, so write the path out in every command instead of keeping it in a variable.
+- Free the port by stopping only what listens on it, not the clients connected to it: `pids=$(lsof -ti tcp:<port> -sTCP:LISTEN 2>/dev/null); [ -n "$pids" ] && kill $pids`. Where lsof is missing (some Linux machines), get the pid from `ss -Hltnp "sport = :<port>" | grep -o 'pid=[0-9]*' | cut -d= -f2`.
+- Start: free the port, then run the command with the Bash tool's run_in_background option and all output going to the log: `<command> >"${TMPDIR:-/tmp}/dev-server-<port>.log" 2>&1`.
+- Wait until it answers: `curl -s -o /dev/null --retry 60 --retry-delay 1 --retry-connrefused "http://127.0.0.1:<port>/"`. If it never answers, show `tail -n 40 "${TMPDIR:-/tmp}/dev-server-<port>.log"` and stop.
 - Restart: stop, then start. Stop: free the port and check that nothing listens on it.
 
 Reply in one line with the URL or the error from the log. When asked about server errors, read the log with tail or grep, never the whole file.
