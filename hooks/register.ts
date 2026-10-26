@@ -1,6 +1,6 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Health, Pause, PlanTaskView, PlanView } from '../types'
+import type { Health, Pause, PlanTaskView, PlanView, Progress } from '../types'
 
 // Lets several Claude Code sessions work in one repo at once, ported from
 // Overlord and cut down to three hooks with no timers, no server and no fetch.
@@ -31,6 +31,12 @@ import type { Health, Pause, PlanTaskView, PlanView } from '../types'
 // so a dozen sessions testing at once do not slow every one of them to a
 // crawl. The hook waits before the command runs and frees the slot after, so
 // the command itself is never changed and permission rules see it as written.
+//
+// Progress. Each session works out what it has cost, how far through its own
+// task list it is (from its TaskCreate, TaskUpdate and TodoWrite calls) and a
+// rough guess at what is left, and shares it with the others. /budget sets a
+// spending budget, and a plan can set one for each task. A session that goes
+// past its budget says so once, to the person and to the model.
 //
 // Plans. /workflow:plan splits a goal into tasks, and each task runs as a
 // background session in its own worktree once the tasks it depends on have
@@ -64,6 +70,14 @@ interface Entry {
   // Changed files, relative to root.
   readonly files: readonly string[]
   readonly seen: number
+  // Missing from sessions running a workflow from before 0.7.0.
+  readonly progress?: Progress | null
+}
+
+// One task of a session's own task list.
+interface TaskItem {
+  readonly subject: string
+  readonly status: 'pending' | 'in_progress' | 'completed'
 }
 
 // Git runs at most this often, since a prompt or Bash call can come every second.
@@ -87,6 +101,10 @@ const MAX_TOPIC = 80
 const MAX_PAUSES = 5
 
 const repo = { plugin: 'workflow', key: 'repo' } as const
+const budgetRef = { plugin: 'workflow', key: 'budget' } as const
+
+// The tools a session keeps its own task list with.
+const TASK_TOOLS: ReadonlySet<string> = new Set(['TaskCreate', 'TaskUpdate', 'TodoWrite'])
 
 // The Claude Code process and its port slot, found once. A slot belongs to
 // the process, so /clear keeps it, and slot.sh takes it back once the process exits.
@@ -118,6 +136,19 @@ let toldSetup = false
 let toldPorts = false
 // The repo's newest plans, read when the session looks.
 let plans: PlanView[] = []
+// The session's task list: TaskCreate and TaskUpdate change it one task at a
+// time, and TodoWrite sends the whole list, which then wins.
+let tasks = new Map<string, TaskItem>()
+let todos: TaskItem[] | null = null
+// When the task list started and what the session had cost by then.
+let listStart: { at: number; usd: number } | null = null
+// When the session last called a tool, so idle time at the end does not count.
+let activeAt = 0
+let progress: Progress | null = null
+// True once the session heard it went past its budget.
+let isBudgetTold = false
+// The budget its plan task sets, looked up once.
+let planBudget: Promise<number | null> | undefined
 // Each file and set of peers already paused once.
 let paused = new Set<string>()
 // The last few pauses, newest first, for the pane.
@@ -144,6 +175,13 @@ function forget(): void {
   pauses = []
   noticed = new Set()
   plans = []
+  tasks = new Map()
+  todos = null
+  listStart = null
+  activeAt = 0
+  progress = null
+  isBudgetTold = false
+  planBudget = undefined
 }
 
 // A command's output, or null when it fails. Git never stops to ask for a password.
@@ -363,7 +401,8 @@ function myFiles(): string[] {
 }
 
 async function save($: EngineInterface, place: Place): Promise<void> {
-  const entry: Entry = { id, pid: await ownPid($), root: place.root, branch, topic, files: myFiles(), seen: await $.clock.now() }
+  await measure($, place)
+  const entry: Entry = { id, pid: await ownPid($), root: place.root, branch, topic, files: myFiles(), seen: await $.clock.now(), progress }
   await $.fs.write(`${sessionsDir(place)}/${id}.json`, JSON.stringify(entry))
   await publish($, place)
 }
@@ -419,7 +458,7 @@ async function publish($: EngineInterface, place: Place): Promise<void> {
     target: place.target,
     branch,
     files,
-    peers: others.map(peer => ({ topic: peer.topic, where: whereOf(peer, place), files: [...peer.files] })),
+    peers: others.map(peer => ({ topic: peer.topic, where: whereOf(peer, place), files: [...peer.files], progress: peer.progress ?? null })),
     paused: pauses,
     upstream: upstream.filter(file => mine.has(file)),
     checks,
@@ -427,6 +466,7 @@ async function publish($: EngineInterface, place: Place): Promise<void> {
     ports: slot === null ? null : PORT_BASE + slot * PORT_STEP,
     setup,
     plans,
+    progress,
   })
 }
 
@@ -539,6 +579,123 @@ async function pause($: EngineInterface, place: Place, relative: string): Promis
   ].join('\n')
 }
 
+function taskList(): TaskItem[] {
+  return todos ?? [...tasks.values()]
+}
+
+// Notes a call the session made to its own task tools. Only the main loop's
+// list counts, since a subagent's is its own.
+async function track($: EngineInterface, tool: string, input: Readonly<Record<string, unknown>>, text: string): Promise<void> {
+  const now = await $.clock.now()
+  if (listStart === null || taskList().length === 0) {
+    listStart = { at: now, usd: (await $.session.usage()).cost?.usd ?? 0 }
+  }
+  const status = (value: unknown): TaskItem['status'] | null =>
+    value === 'pending' || value === 'in_progress' || value === 'completed' ? value : null
+  if (tool === 'TaskCreate') {
+    // TaskCreate answers "Task #3 created successfully: ...".
+    const number = /^Task #(\S+) created/.exec(text)?.[1]
+    if (number !== undefined && typeof input.subject === 'string') {
+      tasks.set(number, { subject: input.subject, status: 'pending' })
+    }
+  } else if (tool === 'TaskUpdate' && typeof input.taskId === 'string') {
+    const task = tasks.get(input.taskId)
+    if (input.status === 'deleted') {
+      tasks.delete(input.taskId)
+    } else if (task !== undefined) {
+      tasks.set(input.taskId, {
+        subject: typeof input.subject === 'string' ? input.subject : task.subject,
+        status: status(input.status) ?? task.status,
+      })
+    }
+  } else if (tool === 'TodoWrite' && Array.isArray(input.todos)) {
+    todos = (input.todos as unknown[]).flatMap(item => {
+      const todo = (typeof item === 'object' && item !== null ? item : {}) as { content?: unknown; status?: unknown }
+      const given = status(todo.status)
+      return typeof todo.content === 'string' && given !== null ? [{ subject: todo.content, status: given }] : []
+    })
+  }
+}
+
+// The budget /budget set, or else the one the session's plan task sets.
+async function budgetOf($: EngineInterface, place: Place | null): Promise<number | null> {
+  const set = (await $.state.get(budgetRef)).value
+  if (set !== undefined && set !== null) {
+    return set
+  }
+  if (place === null) {
+    return null
+  }
+  planBudget ??= ownTask($, place).then(async mine => {
+    const plan = mine === null ? null : await readPlan($, mine.dir)
+    return typeof plan?.taskBudgetUsd === 'number' ? plan.taskBudgetUsd : null
+  })
+  return planBudget
+}
+
+// Reads what the session has cost and works out how far it has got. A share
+// of the task list done so far cost so much and took so long, so the rest
+// should cost about the same per share. Tasks in progress count as half done.
+async function measure($: EngineInterface, place: Place | null): Promise<void> {
+  const usage = await $.session.usage()
+  const usd = usage.cost?.usd ?? 0
+  const items = taskList()
+  const done = items.filter(item => item.status === 'completed').length
+  const active = items.filter(item => item.status === 'in_progress')
+  const share = items.length === 0 ? 0 : (done + active.length / 2) / items.length
+  const rest = (1 - share) / share
+  const left =
+    listStart !== null && done > 0 && share < 1 && activeAt > listStart.at
+      ? { usd: Math.max(0, usd - listStart.usd) * rest, ms: Math.round((activeAt - listStart.at) * rest) }
+      : null
+  progress = {
+    usd,
+    budget: await budgetOf($, place),
+    tasks: items.length === 0 ? null : { done, total: items.length, current: active[0]?.subject ?? null },
+    left,
+    fiveHour: usage.rateLimits.find(limit => limit.kind === 'five_hour')?.percentUsed ?? null,
+  }
+}
+
+function dollars(usd: number): string {
+  return `$${usd.toFixed(2)}`
+}
+
+// Tells the person and the model once that the session went past its budget.
+async function budgetNote($: EngineInterface, place: Place | null): Promise<string | null> {
+  if (progress === null || progress.budget === null || progress.usd < progress.budget || isBudgetTold) {
+    return null
+  }
+  isBudgetTold = true
+  const spent = `${dollars(progress.usd)}, past its budget of ${dollars(progress.budget)}`
+  await $.ui.notify(`This session has cost ${spent}. Claude was asked to wrap up.`, { title: 'workflow: over budget' })
+  const isTask = place !== null && (await ownTask($, place)) !== null
+  return `workflow: this session has cost ${spent}. Finish the step you are on, commit what works, then stop and say where you got to.${isTask ? ' If the task is not done, land nothing and end with a line FAILED over budget.' : ''}`
+}
+
+// Answers /budget: sets this session's budget, clears it with "off", or says what it is.
+async function setBudget($: EngineInterface, args: string): Promise<string> {
+  const said = args.trim().replace(/^\$/, '')
+  if (said === '') {
+    const budget = await budgetOf($, await ready($))
+    await measure($, await ready($))
+    const spent = `This session has cost ${dollars(progress?.usd ?? 0)}`
+    return budget === null ? `${spent} and has no budget. Set one with /budget <dollars>.` : `${spent} of its ${dollars(budget)} budget.`
+  }
+  if (said === 'off') {
+    await $.state.set(budgetRef, null)
+    isBudgetTold = false
+    return 'Cleared the budget.'
+  }
+  const budget = Number(said)
+  if (!Number.isFinite(budget) || budget <= 0) {
+    return 'Give the budget in dollars, like /budget 5, or /budget off to clear it.'
+  }
+  await $.state.set(budgetRef, budget)
+  isBudgetTold = false
+  return `This session's budget is ${dollars(budget)}. You and Claude hear once when it is past that.`
+}
+
 // Plans. The /workflow:plan skill drafts tasks with the person and hands them
 // to the plan tool, which saves them under <git common dir>/workflow/plans/<id>/
 // and starts each task whose dependencies have landed as a background session
@@ -569,6 +726,8 @@ interface Plan {
   readonly summary: string
   readonly createdAt: number
   readonly tasks: readonly Task[]
+  // The budget for each task's session in dollars. Missing before 0.7.0.
+  readonly taskBudgetUsd?: number | null
 }
 
 interface Outcome {
@@ -576,6 +735,8 @@ interface Outcome {
   readonly sha: string | null
   readonly note: string | null
   readonly at: number
+  // What the session had cost by then. Missing before 0.7.0.
+  readonly usd?: number | null
 }
 
 // The session a task runs in: its background id and its name.
@@ -755,25 +916,37 @@ async function advance($: EngineInterface, place: Place, planId: string): Promis
   }
 }
 
-// How a plan stands, for the pane and the plan tool.
-async function viewPlan($: EngineInterface, dir: string, plan: Plan): Promise<PlanView> {
+// What each live session in the repo has cost, by session id.
+async function costs($: EngineInterface, place: Place): Promise<Map<string, number>> {
+  const found = new Map((await peers($, place)).flatMap(peer => (peer.progress == null ? [] : [[peer.id, peer.progress.usd] as const])))
+  if (progress !== null) {
+    found.set(id, progress.usd)
+  }
+  return found
+}
+
+// How a plan stands, for the pane and the plan tool. spent is what live
+// sessions have cost, by session id.
+async function viewPlan($: EngineInterface, dir: string, plan: Plan, spent: ReadonlyMap<string, number>): Promise<PlanView> {
   const isStopped = await $.fs.exists(`${dir}/stopped`)
-  const tasks: PlanTaskView[] = []
+  const views: PlanTaskView[] = []
   for (const task of plan.tasks) {
     const outcome = await readOutcome($, dir, task.id)
     const started = await readStarted($, dir, task.id)
     const state = outcome !== null ? outcome.state : isStopped ? 'stopped' : started !== null ? 'running' : 'waiting'
     const note = outcome === null ? null : outcome.state === 'landed' ? (outcome.sha?.slice(0, 7) ?? null) : outcome.note
-    tasks.push({ id: task.id, title: task.title, state, note, session: started?.name ?? null })
+    const bg = started?.bg ?? null
+    const live = bg === null ? undefined : [...spent].find(([session]) => session.startsWith(bg))?.[1]
+    views.push({ id: task.id, title: task.title, state, note, session: started?.name ?? null, usd: outcome?.usd ?? live ?? null })
   }
   const state = isStopped
     ? 'stopped'
-    : tasks.every(task => task.state === 'landed')
+    : views.every(task => task.state === 'landed')
       ? 'done'
-      : tasks.some(task => task.state === 'failed') && !tasks.some(task => task.state === 'running')
+      : views.some(task => task.state === 'failed') && !views.some(task => task.state === 'running')
         ? 'failed'
         : 'running'
-  return { id: plan.id, goal: plan.goal, state, tasks }
+  return { id: plan.id, goal: plan.goal, state, tasks: views }
 }
 
 // The repo's newest plans, after starting what is due in the running ones.
@@ -788,6 +961,7 @@ async function readPlans($: EngineInterface, place: Place): Promise<PlanView[]> 
     // Ids are the time they were made in base 36, so they sort by age.
     .sort((a, b) => b.length - a.length || b.localeCompare(a))
     .slice(0, MAX_PLANS)
+  const spent = ids.length === 0 ? new Map<string, number>() : await costs($, place)
   const views: PlanView[] = []
   for (const planId of ids) {
     const dir = `${root}/${planId}`
@@ -795,10 +969,10 @@ async function readPlans($: EngineInterface, place: Place): Promise<PlanView[]> 
     if (plan === null) {
       continue
     }
-    let view = await viewPlan($, dir, plan)
+    let view = await viewPlan($, dir, plan, spent)
     if (view.state === 'running') {
       await advance($, place, planId)
-      view = await viewPlan($, dir, plan)
+      view = await viewPlan($, dir, plan, spent)
     }
     views.push(view)
   }
@@ -848,17 +1022,19 @@ async function finish($: EngineInterface, place: Place, answer: string): Promise
     return
   }
   const at = await $.clock.now()
+  await measure($, place)
+  const usd = progress?.usd ?? null
   let outcome: Outcome
   if ('why' in said) {
-    outcome = { state: 'failed', sha: null, note: said.why, at }
+    outcome = { state: 'failed', sha: null, note: said.why, at, usd }
   } else if (place.target === null) {
-    outcome = { state: 'failed', sha: said.sha, note: 'origin has no default branch to check the commit against.', at }
+    outcome = { state: 'failed', sha: said.sha, note: 'origin has no default branch to check the commit against.', at, usd }
   } else {
     await run($, place.root, ['git', 'fetch', '-q', 'origin', place.target], 60_000)
     const isLanded = (await run($, place.root, ['git', 'merge-base', '--is-ancestor', said.sha, `origin/${place.target}`])) !== null
     outcome = isLanded
-      ? { state: 'landed', sha: said.sha, note: null, at }
-      : { state: 'failed', sha: said.sha, note: `It said it landed ${said.sha.slice(0, 7)}, but that commit is not on ${place.target}.`, at }
+      ? { state: 'landed', sha: said.sha, note: null, at, usd }
+      : { state: 'failed', sha: said.sha, note: `It said it landed ${said.sha.slice(0, 7)}, but that commit is not on ${place.target}.`, at, usd }
   }
   await writeOutcome($, mine.dir, mine.task, outcome)
   await advance($, place, mine.dir.split('/').at(-1) ?? '')
@@ -893,6 +1069,7 @@ const PLAN_TOOL = {
           required: ['id', 'title', 'prompt', 'dependsOn', 'files'],
         },
       },
+      taskBudgetUsd: { type: 'number', description: 'The most each task\'s session should spend, in dollars, when the person gave one.' },
       plan: { type: 'string', description: 'The plan id, for stop and retry.' },
       task: { type: 'string', description: 'The task id, for retry.' },
     },
@@ -904,7 +1081,10 @@ const PLAN_TOOL = {
 function planLines(view: PlanView): string {
   return [
     `Plan ${view.id} (${view.state}): ${view.goal}`,
-    ...view.tasks.map(task => `- ${task.id}: ${task.state}${task.note === null ? '' : ` (${task.note})`}${task.session === null ? '' : `, session ${task.session}`}`),
+    ...view.tasks.map(
+      task =>
+        `- ${task.id}: ${task.state}${task.note === null ? '' : ` (${task.note})`}${task.session === null ? '' : `, session ${task.session}`}${task.usd === null ? '' : `, ${dollars(task.usd)}`}`,
+    ),
   ].join('\n')
 }
 
@@ -930,13 +1110,21 @@ async function planTool($: EngineInterface, input: Readonly<Record<string, unkno
       throw new Error('A plan needs a goal.')
     }
     const createdAt = await $.clock.now()
-    const made: Plan = { id: createdAt.toString(36), goal: input.goal.trim(), summary: typeof input.summary === 'string' ? input.summary : '', createdAt, tasks }
+    const budget = typeof input.taskBudgetUsd === 'number' && input.taskBudgetUsd > 0 ? input.taskBudgetUsd : null
+    const made: Plan = {
+      id: createdAt.toString(36),
+      goal: input.goal.trim(),
+      summary: typeof input.summary === 'string' ? input.summary : '',
+      createdAt,
+      tasks,
+      taskBudgetUsd: budget,
+    }
     await $.fs.write(`${root}/${made.id}/plan.json`, JSON.stringify(made, null, 2))
     await advance($, place, made.id)
     lookedAt = 0
     await look($, place)
     await publish($, place)
-    const view = await viewPlan($, `${root}/${made.id}`, made)
+    const view = await viewPlan($, `${root}/${made.id}`, made, await costs($, place))
     return `${planLines(view)}\n\nRunning tasks land on their own, and the rest start as the tasks they depend on land. The /boom pane shows the plan.`
   }
   if (dir === null || plan === null) {
@@ -968,14 +1156,17 @@ async function planTool($: EngineInterface, input: Readonly<Record<string, unkno
   lookedAt = 0
   await look($, place)
   await publish($, place)
-  return planLines(await viewPlan($, dir, plan))
+  return planLines(await viewPlan($, dir, plan, await costs($, place)))
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.tool.register(PLAN_TOOL)
+    await $.command.register({ name: 'budget', description: 'Set this session\'s spending budget in dollars, or clear it', argumentHint: '<dollars> | off' })
     return next(e)
   }).catch(($, e, next) => next(e))
+
+  on('command.run', { command: 'budget' }, async ($, e) => ({ text: await setBudget($, e.args) }))
 
   on('session.end', async ($, e, next) => {
     // A session that never looked has nothing to remove and nothing to set up.
@@ -1000,7 +1191,7 @@ export const register: Register = on => {
       topic ??= topicOf(e.text)
       await look($, place)
       await save($, place)
-      notes.push(setupNote(), await peerNote($, place), landingNote(place))
+      notes.push(setupNote(), await peerNote($, place), landingNote(place), await budgetNote($, place))
     }
     const given = notes.filter((note): note is string => note !== null)
     return given.length === 0 ? next(e) : next({ ...e, context: [...(e.context ?? []), ...given] })
@@ -1026,7 +1217,7 @@ export const register: Register = on => {
       // The ports, for a session that started before the plugin loaded.
       await slotted($)
     }
-    const place = file === null && e.tool !== 'Bash' ? null : await ready($)
+    const place = file === null && e.tool !== 'Bash' && !TASK_TOOLS.has(e.tool) ? null : await ready($)
     const relative = place === null || file === null ? null : relativeTo(place.root, file)
     if (place !== null && relative !== null) {
       const warning = await pause($, place, relative)
@@ -1047,6 +1238,12 @@ export const register: Register = on => {
     if (ran.deny !== undefined) {
       return ran
     }
+    if (e.agentId === undefined) {
+      activeAt = await $.clock.now()
+      if (TASK_TOOLS.has(e.tool)) {
+        await track($, e.tool, e, ran.text ?? '')
+      }
+    }
     if (place === null) {
       return waitNote === null ? ran : { ...ran, context: [...(ran.context ?? []), waitNote] }
     }
@@ -1056,7 +1253,7 @@ export const register: Register = on => {
       await look($, place)
     }
     await save($, place)
-    const notes = [waitNote, landingNote(place)].filter((note): note is string => note !== null)
+    const notes = [waitNote, landingNote(place), await budgetNote($, place)].filter((note): note is string => note !== null)
     return notes.length === 0 ? ran : { ...ran, context: [...(ran.context ?? []), ...notes] }
   }).catch(($, e, next) => next(e))
 

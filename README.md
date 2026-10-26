@@ -65,6 +65,13 @@ claude plugin install workflow@shanep
   once the tasks it depends on have landed, and the /boom pane follows them.
   `/workflow:plan stop <plan>` stops one and `/workflow:plan retry <plan>
   <task>` starts a task again.
+- **Tracks progress and budget.** Each session works out what it has cost,
+  how far through its own task list it is and a rough guess at the time and
+  money left, and the /boom pane shows it for every session. `/budget 5` sets
+  a $5 budget for the session, `/budget off` clears it and `/budget` says
+  where it stands. A plan can give each task a budget too. A session that
+  goes past its budget tells you once with a notification, and Claude is
+  asked to wrap up. A plan task over budget lands nothing and ends FAILED.
 
 ## How it works
 
@@ -103,13 +110,20 @@ starts once, since only one session gets to `mkdir` its marker. A task whose
 session ends without either line stays running until you retry it or stop
 the plan.
 
+Progress comes from Claude Code's own cost count and from the session's
+TaskCreate, TaskUpdate and TodoWrite calls. The guess at what is left takes
+the time and money spent since the list was made and scales it by the share
+of tasks still open, so it is rough until a few tasks are done. The budget
+is checked when a prompt is sent and after each tool call.
+
 ## For other plugins
 
 The plugin keeps what it knows in `$.state` under `workflow.repo`: the
 checkout, the target branch, this session's files, the other sessions, recent
 pauses, the upstream files to rebase on, the port base, how the worktree setup
 went, how many check slots are busy, what the startup check found and the
-newest plans.
+newest plans, with what each task cost, and this session's progress and
+budget.
 `types/index.d.ts` has the shape. Copy the `Repo` type into your own contract
 instead of listing `workflow` under `dependencies`, since a missing dependency
 turns your whole plugin off. The `/boom` pane in

@@ -28,4 +28,4 @@ If the arguments start with `stop` or `retry`, call the plan tool with `action` 
 
 4. Ask with AskUserQuestion whether to start it, with the options Start, Change and Cancel. On Change, ask what to change, redo the plan and ask again. On Cancel, stop.
 
-5. On Start, call the plan tool with `action` "start", `goal` (the goal in the person's words), `summary` (your paragraph) and `tasks`. Show what it answers in a few lines. The tasks land on their own from here, and the /boom pane follows them.
+5. On Start, call the plan tool with `action` "start", `goal` (the goal in the person's words), `summary` (your paragraph) and `tasks`. When the person gave a spending limit for each task, pass it as `taskBudgetUsd` in dollars. Show what it answers in a few lines. The tasks land on their own from here, and the /boom pane follows them.
