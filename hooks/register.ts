@@ -1,6 +1,6 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Pause } from '../types'
+import type { Health, Pause } from '../types'
 
 // Lets several Claude Code sessions work in one repo at once, ported from
 // Overlord and cut down to three hooks with no timers, no server and no fetch.
@@ -46,6 +46,8 @@ interface Place {
   readonly target: string | null
   // True in the main checkout, where every session shares the working tree.
   readonly isMain: boolean
+  // This checkout's own git dir, where scripts/health.sh leaves what it found.
+  readonly gitDir: string
 }
 
 // What one session tells the others.
@@ -102,6 +104,8 @@ let upstream: string[] = []
 let lookedAt = 0
 // How many check slots were busy, out of how many, when the session last looked.
 let checks: { busy: number; slots: number } | null = null
+// What scripts/health.sh found when the session started, once it is done.
+let health: Health | null = null
 // The set of peers the session was last told about, or null before the first prompt.
 let told: string | null = null
 // What setting up the worktree came to, for the pane and the first prompt.
@@ -125,6 +129,7 @@ function forget(): void {
   upstream = []
   lookedAt = 0
   checks = null
+  health = null
   told = null
   setup = null
   toldSetup = false
@@ -223,8 +228,10 @@ async function setUp($: EngineInterface, place: Place): Promise<void> {
 async function locate($: EngineInterface): Promise<Place | null> {
   id = await $.session.id()
   const cwd = await $.session.cwd()
-  const [root, common] = lines(await run($, cwd, ['git', 'rev-parse', '--path-format=absolute', '--show-toplevel', '--git-common-dir']))
-  if (root === undefined || common === undefined) {
+  const [root, common, gitDir] = lines(
+    await run($, cwd, ['git', 'rev-parse', '--path-format=absolute', '--show-toplevel', '--git-common-dir', '--absolute-git-dir']),
+  )
+  if (root === undefined || common === undefined || gitDir === undefined) {
     return null
   }
   const head = await run($, root, ['git', 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])
@@ -233,6 +240,7 @@ async function locate($: EngineInterface): Promise<Place | null> {
     common,
     target: head === null ? null : head.replace(/^origin\//, ''),
     isMain: common === `${root}/.git`,
+    gitDir,
   }
   await setUp($, place)
   return place
@@ -264,7 +272,28 @@ async function look($: EngineInterface, place: Place): Promise<void> {
   const dir = await shared($)
   const count = dir === null ? null : await run($, '/', ['sh', `${$.plugin.root}/scripts/turn.sh`, `${dir}/checks`, 'count'])
   const [busy, slots] = (count ?? '').split(' ').map(Number)
+  health = await readHealth($, place)
   checks = busy === undefined || slots === undefined || Number.isNaN(busy) || Number.isNaN(slots) ? null : { busy, slots }
+}
+
+// The time health.sh ran, then its problems, each starting with "- " and
+// running on over any indented lines after it.
+async function readHealth($: EngineInterface, place: Place): Promise<Health | null> {
+  const file = `${place.gitDir}/workflow-health`
+  if (!(await $.fs.exists(file))) {
+    return null
+  }
+  const [at, ...rest] = (await $.fs.read(file)).split('\n')
+  const problems: string[] = []
+  for (const line of rest) {
+    if (line.startsWith('- ')) {
+      problems.push(line.slice(2))
+    } else if (line.trim() !== '' && problems.length > 0) {
+      problems[problems.length - 1] += `\n${line}`
+    }
+  }
+  const seconds = Number(at)
+  return Number.isNaN(seconds) ? null : { at: seconds * 1000, problems }
 }
 
 // A check slot this session holds, and how long it waited for it.
@@ -386,6 +415,7 @@ async function publish($: EngineInterface, place: Place): Promise<void> {
     paused: pauses,
     upstream: upstream.filter(file => mine.has(file)),
     checks,
+    health,
     ports: slot === null ? null : PORT_BASE + slot * PORT_STEP,
     setup,
   })

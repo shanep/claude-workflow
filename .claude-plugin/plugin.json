@@ -1,9 +1,9 @@
 {
   "name": "workflow",
   "displayName": "Workflow",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "types": "./types/index.d.ts",
-  "description": "Keep parallel Claude Code sessions in one repo out of each other's files and ports, set up new worktrees and take turns at checks",
+  "description": "Keep parallel Claude Code sessions in one repo out of each other's files and ports, set up new worktrees, take turns at checks and check the repo at startup",
   "author": {
     "name": "Shane Panter",
     "email": "shanepanter@boisestate.edu"

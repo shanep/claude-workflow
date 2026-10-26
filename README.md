@@ -4,8 +4,8 @@ A Claude Code plugin that keeps parallel sessions in one git repo out of each
 other's files and ports, and keeps their checks from swamping the machine. Run a few sessions at once, in the main checkout or
 in worktrees, and each one knows what the others are changing.
 
-It is three hooks and some files in `.git`. There are no timers, no server and
-no background fetch, and every hook lets the call through if it breaks, so a
+It is three hooks, a startup script and some files in `.git`. There are no
+timers and no server, and every hook lets the call through if it breaks, so a
 bad check never stops your work.
 
 ## Install
@@ -17,6 +17,13 @@ claude plugin install workflow@shanep
 
 ## What it does
 
+- **Checks the repo at startup.** When a session starts, a script checks in
+  the background that the repo is healthy at head and set up for an agent:
+  no half done rebase or merge, the default branch level with origin, no
+  branch with work that never landed, CI green on head (or the repo's own
+  check command passing at origin's head when there is no CI), git hooks that
+  actually run, and a check command an agent can find. Claude opens its first
+  reply with any problems and offers to fix them. A healthy repo says nothing.
 - **Tells Claude who else is here.** The first prompt in a session, and any
   prompt after a session starts or stops, gets a note listing the other
   sessions in the repo, what each one is working on (its first prompt) and
@@ -57,9 +64,9 @@ since it left the default branch, plus untracked files. In the main checkout
 every session shares one working tree, so only the files a session edited
 count as its own.
 
-Git runs at most every 30 seconds, on a prompt or after a Bash call. Nothing
-fetches. Worktrees share their remote branches, so once any session lands or
-fetches, the others see it.
+Git runs at most every 30 seconds, on a prompt or after a Bash call. Only the
+startup check fetches, once per session. Worktrees share their remote branches,
+so once any session lands or fetches, the others see it.
 
 Port slots are folders under `~/.claude/workflow/slots/`. A session claims the
 lowest free one with `mkdir`, which only one session can win, and a slot whose
@@ -75,10 +82,11 @@ exits if Claude Code does, so a crash or Esc never leaves a slot taken.
 
 The plugin keeps what it knows in `$.state` under `workflow.repo`: the
 checkout, the target branch, this session's files, the other sessions, recent
-pauses, the upstream files to rebase on, the port base, how the worktree
-setup went and how many check slots are busy. `types/index.d.ts` has the shape. Copy the `Repo` type into your
-own contract instead of listing `workflow` under `dependencies`, since a
-missing dependency turns your whole plugin off. The `/boom` pane in
+pauses, the upstream files to rebase on, the port base, how the worktree setup
+went, how many check slots are busy and what the startup check found.
+`types/index.d.ts` has the shape. Copy the `Repo` type into your own contract
+instead of listing `workflow` under `dependencies`, since a missing dependency
+turns your whole plugin off. The `/boom` pane in
 [drboom](https://github.com/shanep/claude-DrBOOM) does this.
 
 ## Checks
